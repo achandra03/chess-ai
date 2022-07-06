@@ -84,7 +84,19 @@ class Board:
 		p.hasMoved = True
 		p.x = newX
 		p.y = newY
+
+        #If capturing, remove old piece from spot
+		self.pieces[newY][newX] = None
+        
 		self.update()
+
+
+        #Handle promotion
+		if(type(p) is Pawn):
+			if(p.white and p.y == 0):
+				self.pieces[p.y][p.x] = Queen(p.x, p.y, p.white, 'whitequeen.png')
+			elif(not p.white and p.y == 7):
+				self.pieces[p.y][p.x] = Queen(p.x, p.y, p.white, 'blackqueen.png')
 
 		#Revert back to old state if king is in check
 		if(self.checked(p.white)):

@@ -79,10 +79,8 @@ class Game:
                     if(self.board.pieces[boardY][boardX] is None):
                         if(self.clickedOn is None):
                             continue
-                        if(self.move(self.clickedOn.x, self.clickedOn.y, boardX, boardY)):
-                            self.clickedOn = None
-                        else:
-                            self.clickedOn = None
+                        self.move(self.clickedOn.x, self.clickedOn.y, boardX, boardY)
+                        self.clickedOn = None
 
                     else:
                         if(self.board.pieces[boardY][boardX].white == self.whiteTurn):
@@ -90,7 +88,7 @@ class Game:
                         else:
                             if(self.clickedOn is None):
                                 continue
-                        if(self.move(self.clickedOn.x, self.clickedOn.y, boardX, boardY)):
+                            self.move(self.clickedOn.x, self.clickedOn.y, boardX, boardY)
                             self.clickedOn = None
 
 game = Game()
