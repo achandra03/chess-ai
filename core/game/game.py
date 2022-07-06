@@ -13,13 +13,13 @@ class Game:
 		size = width, height = 512, 512
 		self.screen = pygame.display.set_mode(size)
 		square_size = (64, 64)
-		self.darksquare = pygame.image.load('/Users/arnavchandra/Desktop/chess/core/game/assets/darksquare.png')
+		self.darksquare = pygame.image.load('assets/darksquare.png')
 		self.darksquare = pygame.transform.scale(self.darksquare, square_size)
-		self.lightsquare = pygame.image.load('/Users/arnavchandra/Desktop/chess/core/game/assets/lightsquare.png')
+		self.lightsquare = pygame.image.load('assets/lightsquare.png')
 		self.lightsquare = pygame.transform.scale(self.lightsquare, square_size)
 		piece_size = (55, 55)
 		self.piece_mapping = {}
-		piece_directory = '/Users/arnavchandra/Desktop/chess/core/game/assets/pieces/'
+		piece_directory = 'assets/pieces/'
 		white = 255, 255, 255
 		for file in os.listdir(piece_directory):
 			if(not file.endswith('.png')):
