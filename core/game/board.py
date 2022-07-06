@@ -42,8 +42,11 @@ class Board:
 
 
 	def makeMove(self, x, y, newX, newY):
-		print('making move')
 		p = self.pieces[y][x]
+		if(p.white):
+			print('white', type(p))
+		else:
+			print('black', type(p))
 
 		#Empty square selected
 		if(p is None):
@@ -52,17 +55,14 @@ class Board:
 
 		#Attempting to move to a square occupied by friendly piece
 		if(self.pieces[newY][newX] is not None and self.pieces[newY][newX].white == p.white):
-			print('moving to occupied square')
 			return False
 
 		#Piece cannot move in the manner described
 		if(not self.pieces[y][x].makeMove(newX, newY, self.pieces)):
-			print('piece cannot move that way')
 			return False
 
 		#Path must be clear (barring knights)
 		if(type(p) is not Knight and self.pathBlocked(x, y, newX, newY)):
-			print('path blocked')
 			return False
 
 		#Taking snapshot of board in case reversion is needed

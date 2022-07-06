@@ -33,7 +33,7 @@ class Game:
 		self.clickedOn = None
 
 
-	def move(x, y, newX, newY):
+	def move(self, x, y, newX, newY):
 		status = self.board.makeMove(x, y, newX, newY)
 		if(status):
 			self.whiteTurn = not self.whiteTurn
@@ -78,8 +78,7 @@ class Game:
 					if(self.board.pieces[boardY][boardX] is None):
 						if(self.clickedOn is None):
 							continue
-						if(self.board.makeMove(self.clickedOn.x, self.clickedOn.y, boardX, boardY)):
-							self.whiteTurn = not self.whiteTurn
+						if(self.move(self.clickedOn.x, self.clickedOn.y, boardX, boardY)):
 							self.clickedOn = None
 						else:
 							self.clickedOn = None
@@ -90,8 +89,7 @@ class Game:
 						else:
 							if(self.clickedOn is None):
 								continue
-							if(self.board.makeMove(self.clickedOn.x, self.clickedOn.y, boardX, boardY)):
-								self.whiteTurn = not self.whiteTurn
+							if(self.move(self.clickedOn.x, self.clickedOn.y, boardX, boardY)):
 								self.clickedOn = None
 
 game = Game()
