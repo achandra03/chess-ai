@@ -175,19 +175,19 @@ class Board:
 		
 		#Check for pawns
 		if(white):
-			if(king.y + 1 < 8 and king.x - 1 > -1):
-				if(self.pieces[king.y + 1][king.x - 1] is not None and type(self.pieces[king.y + 1][king.x - 1] is Pawn and self.pieces[king.y + 1][king.x - 1].white != white)):
+			if(king.y - 1 > -1 and king.x - 1 > -1):
+				if(self.pieces[king.y - 1][king.x - 1] is not None and type(self.pieces[king.y - 1][king.x - 1]) is Pawn and self.pieces[king.y - 1][king.x - 1].white != white):
 					return True
-			if(king.y + 1 < 8 and king.x + 1 < 8):
-				if(self.pieces[king.y + 1][king.x + 1] is not None and type(self.pieces[king.y + 1][king.x + 1] is Pawn and self.pieces[king.y + 1][king.x + 1].white != white)):
+			if(king.y - 1 > -1 and king.x + 1 < 8):
+				if(self.pieces[king.y - 1][king.x + 1] is not None and type(self.pieces[king.y - 1][king.x - 1]) is Pawn and self.pieces[king.y - 1][king.x + 1].white != white):
 					return True
 
 		else:
-			if(king.y - 1 > -1 and king.x - 1 > -1):
-				if(self.pieces[king.y - 1][king.x - 1] is not None and type(self.pieces[king.y - 1][king.x - 1] is Pawn and self.pieces[king.y - 1][king.x - 1].white != white)):
+			if(king.y + 1 < 8 and king.x - 1 > -1):
+				if(self.pieces[king.y + 1][king.x - 1] is not None and type(self.pieces[king.y + 1][king.x - 1]) is Pawn and self.pieces[king.y + 1][king.x - 1].white != white):
 					return True
-			if(king.y - 1 > -1 and king.x + 1 < 8):
-				if(self.pieces[king.y - 1][king.x + 1] is not None and type(self.pieces[king.y - 1][king.x + 1] is Pawn and self.pieces[king.y - 1][king.x + 1].white != white)):
+			if(king.y + 1 < 8 and king.x + 1 < 8):
+				if(self.pieces[king.y + 1][king.x + 1] is not None and type(self.pieces[king.y + 1][king.x + 1]) is Pawn and self.pieces[king.y + 1][king.x + 1].white != white):
 					return True
 
 
@@ -220,7 +220,7 @@ class Board:
 					x += dx
 					y += dy
 					continue
-				if((self.pieces[y][x].white != white) and type(self.pieces[y][x]) is Queen or type(self.pieces[y][x]) is Rook):
+				if((self.pieces[y][x].white != white) and (type(self.pieces[y][x]) is Queen or type(self.pieces[y][x]) is Rook)):
 					return True
 				break
 
@@ -230,11 +230,8 @@ class Board:
 					x += dx
 					y += dy
 					continue
-				if((self.pieces[y][x].white != white) and type(self.pieces[y][x]) is Queen or type(self.pieces[y][x]) is Bishop):
+				if((self.pieces[y][x].white != white) and (type(self.pieces[y][x]) is Queen or type(self.pieces[y][x]) is Bishop)):
 					return True
-
-			x += dx
-			y += dy
-
+				break
 
 		return False

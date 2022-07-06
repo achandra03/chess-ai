@@ -18,7 +18,7 @@ class Pawn(Piece):
 			return True
 		
 		#1 move ahead valid if no enemy pieces
-		if(newX == self.x and abs(newY - self.y == 1)):
+		if(newX == self.x and abs(newY - self.y) == 1):
 			return True
 
 		#Diagonal valid if capturing
