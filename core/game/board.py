@@ -15,42 +15,37 @@ class Board:
 			curr = [None for j in range(0, 8)]
 			self.pieces.append(curr)
 
-		self.pieces[7][0] = Rook(0, 7, True, 'whiterook.png')
-		self.pieces[7][1] = Knight(1, 7, True, 'whiteknight.png')
-		self.pieces[7][2] = Bishop(2, 7, True, 'whitebishop.png')
-		self.pieces[7][3] = Queen(3, 7, True, 'whitequeen.png')
-		self.pieces[7][4] = King(4, 7, True, 'whiteking.png')
-		self.pieces[7][5] = Bishop(5, 7, True, 'whitebishop.png')
-		self.pieces[7][6] = Knight(6, 7, True, 'whiteknight.png')
-		self.pieces[7][7] = Rook(7, 7, True, 'whiterook.png')
+		self.pieces[7][0] = Rook(0, 7, True, 'whiterook.png', 'R')
+		self.pieces[7][1] = Knight(1, 7, True, 'whiteknight.png', 'N')
+		self.pieces[7][2] = Bishop(2, 7, True, 'whitebishop.png', 'B')
+		self.pieces[7][3] = Queen(3, 7, True, 'whitequeen.png', 'Q')
+		self.pieces[7][4] = King(4, 7, True, 'whiteking.png', 'K')
+		self.pieces[7][5] = Bishop(5, 7, True, 'whitebishop.png', 'B')
+		self.pieces[7][6] = Knight(6, 7, True, 'whiteknight.png', 'N')
+		self.pieces[7][7] = Rook(7, 7, True, 'whiterook.png', 'R')
 
 		for i in range(0, 8):
-			self.pieces[6][i] = Pawn(i, 6, True, 'whitepawn.png')
+			self.pieces[6][i] = Pawn(i, 6, True, 'whitepawn.png', 'P')
 
-		self.pieces[0][0] = Rook(0, 0, False, 'blackrook.png')
-		self.pieces[0][1] = Knight(1, 0, False, 'blackknight.png')
-		self.pieces[0][2] = Bishop(2, 0, False, 'blackbishop.png')
-		self.pieces[0][3] = Queen(3, 0, False, 'blackqueen.png')
-		self.pieces[0][4] = King(4, 0, False, 'blackking.png')
-		self.pieces[0][5] = Bishop(5, 0, False, 'blackbishop.png')
-		self.pieces[0][6] = Knight(6, 0, False, 'blackknight.png')
-		self.pieces[0][7] = Rook(7, 0, False, 'blackrook.png')
+		self.pieces[0][0] = Rook(0, 0, False, 'blackrook.png', 'r')
+		self.pieces[0][1] = Knight(1, 0, False, 'blackknight.png', 'n')
+		self.pieces[0][2] = Bishop(2, 0, False, 'blackbishop.png', 'b')
+		self.pieces[0][3] = Queen(3, 0, False, 'blackqueen.png', 'q')
+		self.pieces[0][4] = King(4, 0, False, 'blackking.png', 'k')
+		self.pieces[0][5] = Bishop(5, 0, False, 'blackbishop.png', 'b')
+		self.pieces[0][6] = Knight(6, 0, False, 'blackknight.png', 'n')
+		self.pieces[0][7] = Rook(7, 0, False, 'blackrook.png', 'r')
 
 		for i in range(0, 8):
-			self.pieces[1][i] = Pawn(i, 1, False, 'blackpawn.png')
+			self.pieces[1][i] = Pawn(i, 1, False, 'blackpawn.png', 'p')
 
 
 
 	def makeMove(self, x, y, newX, newY):
 		p = self.pieces[y][x]
-		if(p.white):
-			print('white', type(p))
-		else:
-			print('black', type(p))
 
 		#Empty square selected
 		if(p is None):
-			print('no piece')
 			return False
 
 		#Attempting to move to a square occupied by friendly piece
@@ -88,23 +83,21 @@ class Board:
         #If capturing, remove old piece from spot
 		self.pieces[newY][newX] = None
         
-		self.update()
-
 
         #Handle promotion
 		if(type(p) is Pawn):
 			if(p.white and p.y == 0):
-				self.pieces[p.y][p.x] = Queen(p.x, p.y, p.white, 'whitequeen.png')
+				self.pieces[p.y][p.x] = Queen(p.x, p.y, p.white, 'whitequeen.png', 'Q')
 			elif(not p.white and p.y == 7):
-				self.pieces[p.y][p.x] = Queen(p.x, p.y, p.white, 'blackqueen.png')
+				self.pieces[p.y][p.x] = Queen(p.x, p.y, p.white, 'blackqueen.png', 'q')
 
 		#Revert back to old state if king is in check
 		if(self.checked(p.white)):
-			print('king in check')
 			self.pieces = snapshot
 			return False
-
+	
 		#Move is valid
+		self.update()
 		return True
 
 
@@ -247,3 +240,33 @@ class Board:
 				break
 
 		return False
+
+	def listPieces(self, w):
+		for i in range(0, 8):
+			for j in range(0, 8):
+				if(self.pieces[i][j] is None or self.pieces[i][j].white != w):
+					continue
+				y = self.pieces[i][j].y
+				x = self.pieces[i][j].x
+				print(type(self.pieces[y][x]), 'on', y, x)	
+
+
+	def allMoves(self, w):
+		#Returns a list of all possible moves in the form (y, x, newY, newX)
+		res = []
+		for i in range(0, 8):
+			for j in range(0, 8):
+				if(self.pieces[i][j] is None or self.pieces[i][j].white != w):
+					continue
+				x = self.pieces[i][j].x
+				y = self.pieces[i][j].y
+				for a in range(0, 8):
+					for b in range(0, 8):
+						if(x == b and y == a):
+							continue
+						snapshot = copy.deepcopy(self.pieces)
+						if(self.makeMove(x, y, b, a)):
+							curr = [y, x, a, b]
+							res.append(curr)
+							self.pieces = snapshot
+		return res

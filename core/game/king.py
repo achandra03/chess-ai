@@ -2,6 +2,7 @@ from piece import Piece
 from rook import Rook
 class King(Piece):
 
+
 	def makeMove(self, newX, newY, board):
 		#Check for right castle
 		if(newY == self.y and newX == self.x + 2):
@@ -42,6 +43,4 @@ class King(Piece):
 			return True
 
 		return False
-
-
 
