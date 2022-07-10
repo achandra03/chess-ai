@@ -11,14 +11,18 @@ class Pawn(Piece):
 		if(not self.white and newY < self.y):
 			return False
 
-		#2 moves ahead only valid if pawn hasn't moved already
+		#2 moves ahead only valid if pawn hasn't moved already and no pieces on square
 		if(newX == self.x and abs(newY - self.y) == 2):
 			if(self.hasMoved):
 				return False
+			if(board[newY][newX] is not None):
+				return False
 			return True
 		
-		#1 move ahead valid if no enemy pieces
+		#1 move ahead valid if no pieces on square
 		if(newX == self.x and abs(newY - self.y) == 1):
+			if(board[newY][newX] is not None):
+				return False
 			return True
 
 		#Diagonal valid if capturing
