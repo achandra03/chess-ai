@@ -9,19 +9,19 @@ class GameParser:
 
 	def __init__(self):
 
-		self.WHITE_KING = 0
-		self.WHITE_QUEEN = 1
-		self.WHITE_ROOK = 2
+		self.WHITE_PAWN = 0
+		self.WHITE_ROOK = 1
+		self.WHITE_KNIGHT = 2
 		self.WHITE_BISHOP = 3
-		self.WHITE_KNIGHT = 4
-		self.WHITE_PAWN = 5
+		self.WHITE_QUEEN = 4
+		self.WHITE_KING = 5
 
-		self.BLACK_KING = 6
-		self.BLACK_QUEEN = 7
-		self.BLACK_ROOK = 8
+		self.BLACK_PAWN = 6
+		self.BLACK_ROOK = 7
+		self.BLACK_KNIGHT = 8
 		self.BLACK_BISHOP = 9
-		self.BLACK_KNIGHT = 10
-		self.BLACK_PAWN = 11
+		self.BLACK_QUEEN = 10
+		self.BLACK_KING = 11
 
 		self.PIECE_TO_POSITION = {'K': self.WHITE_KING, 'Q': self.WHITE_QUEEN, 'R': self.WHITE_ROOK, 'B': self.WHITE_BISHOP, 'N': self.WHITE_KNIGHT, 'P': self.WHITE_PAWN, 'k': self.BLACK_KING, 'q': self.BLACK_QUEEN, 'r': self.BLACK_ROOK, 'b': self.BLACK_BISHOP, 'n': self.BLACK_KNIGHT, 'p': self.BLACK_PAWN}
 
@@ -30,11 +30,12 @@ class GameParser:
 
 		self.imboards = []
 		self.evals = []
+		self.seen = set()
 
 
 
 	def parse_file(self, filename):
-		max_positions = 1000000
+		max_positions = 4000000
 		reset_position = 10000
 		positions = 0
 		outname = 1
@@ -68,7 +69,6 @@ class GameParser:
 		white_move = True
 		positions = 0
 		while(game is not None):
-			positions += 1
 			board = game.board()
 			imboard = []
 			for i in range(8):
@@ -86,26 +86,54 @@ class GameParser:
 
 				piece = squares[square]
 
-				if((piece.color is chess.WHITE and white_move) or (piece.color is chess.BLACK and not white_move)):
-					imboard[y][x][self.PIECE_TO_POSITION[piece.symbol()]] = 1
+				imboard[y][x][self.PIECE_TO_POSITION[piece.symbol()]] = 1
+
+			extra = [0 for i in range(7)]
+			extra[0] = board.turn
+			if(board.is_check()):
+				if(board.turn):
+					extra[1] = 1
 				else:
-					imboard[y][x][self.PIECE_TO_POSITION[piece.symbol()]] = -1
+					extra[2] = 1
+			extra[3] = board.has_kingside_castling_rights(1)
+			extra[4] = board.has_queenside_castling_rights(1)
+			extra[5] = board.has_kingside_castling_rights(0)
+			extra[6] = board.has_queenside_castling_rights(0)
+			imboard.append(extra)
 
 
-			imboard = np.array(imboard)
+			imboard = np.array(imboard, dtype='object')
 			imboard = imboard.flatten()
+			has = ""
+			for i in range(0, len(imboard)):
+				has += str(imboard[i])
+			if(has in self.seen):
+				game = game.next()
+				white_move = not white_move
+				continue
+			self.seen.add(has)
+			positions += 1
 			self.imboards.append(imboard)
 
 			fen_rep = board.fen()
 			self.stockfish.set_fen_position(fen_rep)
 			eva = self.stockfish.get_evaluation()
 			if(eva['type'] == 'cp'):
-				self.evals.append(self.sigmoid(eva['value'] / 100))
+				score = eva['value']
+				if(not board.turn):
+					score *= -1
+				self.evals.append(score)
 			else:
-				if(eva['value'] < 0):
-					self.evals.append(0)
+				if(eva['value'] == 0):
+					if(board.turn):
+						self.evals.append(-10000)
+					else:
+						self.evals.append(10000)
 				else:
-					self.evals.append(1)
+					if(board.turn):
+						self.evals.append(10000)
+					else:
+						self.evals.append(-10000)
 			
 			game = game.next()
 			white_move = not white_move

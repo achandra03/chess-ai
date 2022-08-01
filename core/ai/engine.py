@@ -32,7 +32,7 @@ class Engine:
 	def inv_sigmoid(self, x):
 		return np.log(x / (1 - x))
 
-	def nn_input(self):
+	def nn_input(self, white):
 		imboard = []
 		for i in range(8):
 			curr = []
@@ -47,10 +47,10 @@ class Engine:
 				if(piece is None):
 					continue
 
-				if(not piece.white):
-					imboard[piece.y][piece.x][self.PIECE_TO_POSITION[piece.symbol]] = 1
-				else:
+				if(piece.white != white):
 					imboard[piece.y][piece.x][self.PIECE_TO_POSITION[piece.symbol]] = -1
+				else:
+					imboard[piece.y][piece.x][self.PIECE_TO_POSITION[piece.symbol]] = 1
 
 
 		imboard = np.array(imboard)
@@ -59,8 +59,8 @@ class Engine:
 		return imboard
 
 
-	def eval_position(self):
-		inp = self.nn_input()
+	def eval_position(self, white):
+		inp = self.nn_input(white)
 		eva = self.nn(inp)
 		if(eva[0] == 1):
 			return 100
@@ -71,7 +71,7 @@ class Engine:
 
 	def minimax(self, depth, maximize, alpha, beta):
 		if(depth == 0):
-			return self.eval_position(), None
+			return self.eval_position(maximize), None
 
 		moves = self.board.allMoves(maximize)
 		if(maximize):

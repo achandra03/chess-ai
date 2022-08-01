@@ -25,6 +25,9 @@ last_filename = ""
 train_directory = '/Users/arnavchandra/Desktop/chess/data/positions/train/'
 test_directory = '/Users/arnavchandra/Desktop/chess/data/positions/test/'
 
+def inv_sigmoid(x):
+	return np.log(x / (1 - x))
+
 def generate_batches(file_list, batch_size, file_directory):
 	cnt = 0
 	while True:
@@ -34,9 +37,21 @@ def generate_batches(file_list, batch_size, file_directory):
 		data = pd.read_csv(file_directory + file)
 
 		x = np.array(data['Positions'])
-		Y = np.array(data['Evaluations'])
+		y = np.array(data['Evaluations'])
+
 
 		X = []
+		Y = []
+
+		for entry in y:
+			if(float(entry) == 0.0):
+				Y.append(-1)
+			elif(float(entry) == 1.0):
+				Y.append(1)
+			else:
+				Y.append(np.tanh(inv_sigmoid(float(entry))))
+
+		Y = np.array(Y)
 
 		for pos in x:
 			curr = []
@@ -50,6 +65,7 @@ def generate_batches(file_list, batch_size, file_directory):
 			X.append(curr)
 
 		X = np.array(X)
+
 
 		for idx in range(0, X.shape[0], batch_size):
 			X_loc = X[idx:(idx + batch_size)]
@@ -78,19 +94,19 @@ test_generator = generate_batches(test_filenames, 10000, test_directory)
 
 
 model = tf.keras.Sequential()
-model.add(tf.keras.layers.Dense(2048, input_shape=(768,), activation='elu'))
+model.add(tf.keras.layers.Dense(2048, input_shape=(384,), activation='elu'))
 model.add(tf.keras.layers.BatchNormalization())
 model.add(tf.keras.layers.Dense(2048, activation='elu'))
 model.add(tf.keras.layers.BatchNormalization())
 model.add(tf.keras.layers.Dense(2048, activation='elu'))
-model.add(tf.keras.layers.Dense(1, activation='sigmoid'))
+model.add(tf.keras.layers.BatchNormalization())
+model.add(tf.keras.layers.Dense(1, activation='tanh'))
 
 
 opt = tf.keras.optimizers.SGD(learning_rate=0.001, momentum=0.7, nesterov=True)
 stop = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=100)
-save = tf.keras.callbacks.ModelCheckpoint(filepath='weights.h5', save_weights_only=True, save_best_only=True)
+save = tf.keras.callbacks.ModelCheckpoint(filepath='not_sparse.h5', save_weights_only=True, save_best_only=True)
 model.compile(optimizer=opt, loss='mse')
-model.load_weights('weights.h5')
-model.save("my_model")
+#model.save("my_model")
 model.fit(steps_per_epoch=len(train_filenames), workers=1, x=train_generator, max_queue_size=32, epochs=100000, callbacks=[stop, save], validation_data=test_generator, validation_steps=len(test_filenames), batch_size=256)
 print(last_filename)
