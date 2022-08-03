@@ -77,6 +77,7 @@ class GameParser:
 					c = [0 for i in range(12)]
 					curr.append(c)
 				imboard.append(curr)
+
 					
 
 			squares = board.piece_map()
@@ -88,22 +89,24 @@ class GameParser:
 
 				imboard[y][x][self.PIECE_TO_POSITION[piece.symbol()]] = 1
 
-			extra = [0 for i in range(7)]
-			extra[0] = board.turn
-			if(board.is_check()):
-				if(board.turn):
-					extra[1] = 1
-				else:
-					extra[2] = 1
-			extra[3] = board.has_kingside_castling_rights(1)
-			extra[4] = board.has_queenside_castling_rights(1)
-			extra[5] = board.has_kingside_castling_rights(0)
-			extra[6] = board.has_queenside_castling_rights(0)
-			imboard.append(extra)
-
 
 			imboard = np.array(imboard, dtype='object')
 			imboard = imboard.flatten()
+			imboard = np.append(imboard, [0 for i in range(7)])
+
+
+			imboard[768] = board.turn
+			if(board.is_check()):
+				if(board.turn):
+					imboard[769] = 1
+				else:
+					imboard[770] = 1
+			imboard[771] = board.has_kingside_castling_rights(1)
+			imboard[772] = board.has_queenside_castling_rights(1)
+			imboard[773] = board.has_kingside_castling_rights(0)
+			imboard[774] = board.has_queenside_castling_rights(0)
+
+
 			has = ""
 			for i in range(0, len(imboard)):
 				has += str(imboard[i])
