@@ -51,6 +51,8 @@ class GameParser:
 				if(positions >= reset_position):
 					d = {'Positions': self.imboards, 'Evaluations': self.evals}
 					df = pd.DataFrame(data=d)
+					print(df.shape)
+					exit(0)
 					df.to_csv(str(outname) + '.csv', index=False)
 					outname += 1
 					self.imboards = []
@@ -101,10 +103,10 @@ class GameParser:
 					imboard[769] = 1
 				else:
 					imboard[770] = 1
-			imboard[771] = board.has_kingside_castling_rights(1)
-			imboard[772] = board.has_queenside_castling_rights(1)
-			imboard[773] = board.has_kingside_castling_rights(0)
-			imboard[774] = board.has_queenside_castling_rights(0)
+			imboard[771] = int(board.has_kingside_castling_rights(1))
+			imboard[772] = int(board.has_queenside_castling_rights(1))
+			imboard[773] = int(board.has_kingside_castling_rights(0))
+			imboard[774] = int(board.has_queenside_castling_rights(0))
 
 
 			has = ""

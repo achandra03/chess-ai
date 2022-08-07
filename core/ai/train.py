@@ -37,6 +37,7 @@ def generate_batches(file_list, batch_size, file_directory):
 		data = pd.read_csv(file_directory + file)
 
 		x = np.array(data['Positions'])
+		print(x.shape)
 		y = np.array(data['Evaluations'])
 
 
@@ -56,11 +57,9 @@ def generate_batches(file_list, batch_size, file_directory):
 		for pos in x:
 			curr = []
 			for num in pos:
-				if(num == '-1'):
-					curr.append(-1)
-				elif(num == '1'):
+				if(num == '1'):
 					curr.append(1)
-				elif(num == '0'):
+				else:
 					curr.append(0)
 			X.append(curr)
 

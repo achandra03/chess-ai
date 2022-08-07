@@ -25,17 +25,22 @@ def generate_batches(file_list, batch_size, file_directory):
 
 		for pos in x:
 			curr = []
-			for num in pos:
-				if(num == '-1'):
-					curr.append(-1)
-				elif(num == '1'):
+			for num in pos.split():
+				if(num[0] == '['):
+					num = num[1:]
+				if(num[len(num) - 1] == ']'):
+					num = num.rstrip(num[-1])
+
+				if(num == 'True'):
 					curr.append(1)
-				elif(num == '0'):
+				elif(num == 'False'):
 					curr.append(0)
+				else:
+					curr.append(int(num))
+
 			X.append(curr)
 
 		X = np.array(X)
-		print(X.shape)
 
 
 		for idx in range(0, X.shape[0], batch_size):
@@ -65,8 +70,7 @@ test_generator = generate_batches(test_filenames, 10000, test_directory)
 
 
 encoder = tf.keras.Sequential()
-encoder.add(tf.keras.layers.Dense(775, input_shape=(775,), activation='relu'))
-encoder.add(tf.keras.layers.Dense(512, activation='relu'))
+encoder.add(tf.keras.layers.Dense(512, input_shape=(775,), activation='relu'))
 encoder.add(tf.keras.layers.Dense(256, activation='relu'))
 encoder.add(tf.keras.layers.Dense(128, activation='relu', name='encoded_output'))
 encoder.add(tf.keras.layers.Dense(256, activation='relu'))
