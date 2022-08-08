@@ -77,6 +77,9 @@ encoder.add(tf.keras.layers.Dense(256, activation='relu'))
 encoder.add(tf.keras.layers.Dense(512, activation='relu'))
 encoder.add(tf.keras.layers.Dense(775, activation='sigmoid', name='decoded_output'))
 
-encoder.compile(optimizer='adam', loss='binary_crossentropy')
+save = tf.keras.callbacks.ModelCheckpoint(filepath='encoder_weights.h5', save_weights_only=True, save_best_only=True)
 
-encoder.fit(steps_per_epoch=len(train_filenames), workers=1, x=train_generator, max_queue_size=32, epochs=10, validation_data=test_generator, validation_steps=len(test_filenames), batch_size=256)
+encoder.compile(optimizer='adam', loss='binary_crossentropy')
+encoder.load_weights('encoder_weights.h5')
+
+encoder.fit(steps_per_epoch=len(train_filenames), workers=1, x=train_generator, max_queue_size=32, epochs=100, callbacks=[save], validation_data=test_generator, validation_steps=len(test_filenames), batch_size=256)
