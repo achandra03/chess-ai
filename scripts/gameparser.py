@@ -34,13 +34,13 @@ class GameParser:
 
 
 	def parse_file(self, filename):
-		reset_position = 100000
+		reset_position = 10000
 		positions = 0
 		outname = 1
 		df = pd.read_csv(filename)
 		fens = df['FEN']
 		evals = df['Evaluation']
-		max_positions = 16000000
+		max_positions = 10000000
 		for (position, evaluation) in zip(fens, evals):
 			b = chess.Board()
 			b.set_fen(position)
@@ -94,7 +94,7 @@ class GameParser:
 		imboard = np.append(imboard, [0 for i in range(7)])
 
 
-		imboard[768] = board.turn
+		imboard[768] = int(board.turn)
 		if(board.is_check()):
 			if(board.turn):
 				imboard[769] = 1

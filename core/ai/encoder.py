@@ -1,7 +1,6 @@
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras
-from tensorflow.keras import layers
 import os
 import random
 import pandas as pd
@@ -68,7 +67,7 @@ train_generator = generate_batches(train_filenames, 10000, train_directory)
 test_generator = generate_batches(test_filenames, 10000, test_directory)
 
 
-
+'''
 encoder = tf.keras.Sequential()
 encoder.add(tf.keras.layers.Dense(512, input_shape=(775,), activation='relu'))
 encoder.add(tf.keras.layers.Dense(256, activation='relu'))
@@ -81,5 +80,10 @@ save = tf.keras.callbacks.ModelCheckpoint(filepath='encoder_weights.h5', save_we
 
 encoder.compile(optimizer='adam', loss='binary_crossentropy')
 encoder.load_weights('encoder_weights.h5')
+#encoder.save('encoder_model')
 
 encoder.fit(steps_per_epoch=len(train_filenames), workers=1, x=train_generator, max_queue_size=32, epochs=100, callbacks=[save], validation_data=test_generator, validation_steps=len(test_filenames), batch_size=256)
+'''
+model = keras.models.load_model('static_evaluation_model')
+model.fit(steps_per_epoch=len(train_filenames), workers=1, x=train_generator, max_queue_size=32, epochs=100, validation_data=test_generator, validation_steps=len(test_filenames), batch_size=256)
+

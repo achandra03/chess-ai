@@ -74,7 +74,7 @@ class Game:
 				if(event.type == pygame.QUIT):
 					sys.exit()
 				if(not self.whiteTurn):
-					val, move = self.engine.minimax(1, False, -100000000, 10000000)
+					move = self.engine.selectMove()
 					x = move[1]
 					y = move[0]
 					newX = move[3]

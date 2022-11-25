@@ -39,6 +39,34 @@ class Board:
 		for i in range(0, 8):
 			self.pieces[1][i] = Pawn(i, 1, False, 'blackpawn.png', 'p')
 
+		self.turn = 0
+
+	def has_queenside_castling_rights(self, side):
+		if(side == 0): #black
+			if(self.pieces[0][4] is not None and self.pieces[0][4].filename == 'blackking.png' and not self.pieces[0][4].hasMoved):
+				if(self.pieces[0][0] is not None and self.pieces[0][0].filename == 'blackrook.png' and not self.pieces[0][0].hasMoved):
+					return 1
+			return 0
+
+		else: #white
+			if(self.pieces[7][4] is not None and self.pieces[7][4].filename == 'whiteking.png' and not self.pieces[7][4].hasMoved):
+				if(self.pieces[7][0] is not None and self.pieces[7][0].filename == 'blackrook.png' and not self.pieces[7][0].hasMoved):
+					return 1
+			return 0
+
+
+	def has_kingside_castling_rights(self, side):
+		if(side == 0): #black
+			if(self.pieces[0][4] is not None and self.pieces[0][4].filename == 'blackking.png' and not self.pieces[0][4].hasMoved):
+				if(self.pieces[0][7] is not None and self.pieces[0][7].filename == 'blackrook.png' and not self.pieces[0][7].hasMoved):
+					return 1
+			return 0
+
+		else: #white
+			if(self.pieces[7][4] is not None and self.pieces[7][4].filename == 'whiteking.png' and not self.pieces[7][4].hasMoved):
+				if(self.pieces[7][7] is not None and self.pieces[7][7].filename == 'blackrook.png' and not self.pieces[7][7].hasMoved):
+					return 1
+			return 0
 
 
 	def makeMove(self, x, y, newX, newY):
@@ -79,12 +107,11 @@ class Board:
 		p.hasMoved = True
 		p.x = newX
 		p.y = newY
-
-        #If capturing, remove old piece from spot
 		self.pieces[newY][newX] = None
+		self.update()
         
 
-        #Handle promotion
+		#Handle promotion
 		if(type(p) is Pawn):
 			if(p.white and p.y == 0):
 				self.pieces[p.y][p.x] = Queen(p.x, p.y, p.white, 'whitequeen.png', 'Q')
@@ -98,6 +125,10 @@ class Board:
 	
 		#Move is valid
 		self.update()
+		if(self.turn == 0):
+			self.turn = 1
+		else:
+			self.turn = 0
 		return True
 
 
@@ -151,6 +182,10 @@ class Board:
 					continue
 				if(type(piece) is King and piece.white == white):
 					king = piece
+
+		if(king is None):
+			print('Cannot find king')
+			exit(0)
 		
 		#Check for queens, rooks, and bishops
 		for dx in range(-1, 2):

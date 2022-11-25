@@ -4,15 +4,19 @@ sys.path.append(os.path.abspath('../game'))
 from board import Board
 import tensorflow as tf
 from tensorflow import keras
+from tensorflow.keras import backend as K
 from tensorflow.keras import layers
 import numpy as np
 import copy
 
 class Engine:
+	
 
 	def __init__(self, board):
+		self.encoder = keras.models.load_model('encoder_model')
+		self.func = K.function([self.encoder.get_layer(index=0).input], self.encoder.get_layer(index=2).output)
 		self.board = board
-		self.nn = tf.keras.models.load_model("my_model")
+		self.nn = tf.keras.models.load_model("my_model_v2")
 		self.WHITE_KING = 0
 		self.WHITE_QUEEN = 1
 		self.WHITE_ROOK = 2
@@ -55,18 +59,27 @@ class Engine:
 
 		imboard = np.array(imboard)
 		imboard = imboard.flatten()
-		imboard = imboard.reshape((-1, 768))
-		return imboard
+		imboard = np.append(imboard, [0 for i in range(7)])
+
+		imboard[768] = int(self.board.turn)
+		if(self.board.checked(True) and self.board.turn == 1):
+			imboard[769] = 1
+		elif(self.board.checked(False) and self.board.turn == 0):
+				imboard[770] = 1
+		imboard[771] = int(self.board.has_kingside_castling_rights(1))
+		imboard[772] = int(self.board.has_queenside_castling_rights(1))
+		imboard[773] = int(self.board.has_kingside_castling_rights(0))
+		imboard[774] = int(self.board.has_queenside_castling_rights(0))
+
+
+		imboard = imboard.reshape((-1, 775))
+		return self.func([imboard])
 
 
 	def eval_position(self, white):
 		inp = self.nn_input(white)
 		eva = self.nn(inp)
-		if(eva[0] == 1):
-			return 100
-		if(eva[0] == 0):
-			return -100
-		return self.inv_sigmoid(eva[0])
+		return eva
 
 
 	def minimax(self, depth, maximize, alpha, beta):
@@ -114,3 +127,23 @@ class Engine:
 				if(beta <= alpha):
 					break
 			return best, ret
+
+	def selectMove(self):
+		moves = self.board.allMoves(False)
+		bestEval = 1000
+		bestMove = None
+		for move in moves:
+			y = move[0]
+			x = move[1]
+			newY = move[2]
+			newX = move[3]
+			snapshot = copy.deepcopy(self.board.pieces)
+			self.board.makeMove(x, y, newX, newY)
+			newEval = self.eval_position(False)
+			if(newEval < bestEval):
+				bestEval = newEval
+				bestMove = move
+			self.board.pieces = snapshot
+		print(bestEval)
+		return bestMove
+
