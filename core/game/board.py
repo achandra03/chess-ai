@@ -41,6 +41,9 @@ class Board:
 
 		self.turn = 0
 
+	def is_check(self):
+		return self.checked(True) or self.checked(False)
+
 	def has_queenside_castling_rights(self, side):
 		if(side == 0): #black
 			if(self.pieces[0][4] is not None and self.pieces[0][4].filename == 'blackking.png' and not self.pieces[0][4].hasMoved):
