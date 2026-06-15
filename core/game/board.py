@@ -50,7 +50,7 @@ class Board:
 
 		else: #white
 			if(self.pieces[7][4] is not None and self.pieces[7][4].filename == 'whiteking.png' and not self.pieces[7][4].hasMoved):
-				if(self.pieces[7][0] is not None and self.pieces[7][0].filename == 'blackrook.png' and not self.pieces[7][0].hasMoved):
+				if(self.pieces[7][0] is not None and self.pieces[7][0].filename == 'whiterook.png' and not self.pieces[7][0].hasMoved):
 					return 1
 			return 0
 
@@ -64,7 +64,7 @@ class Board:
 
 		else: #white
 			if(self.pieces[7][4] is not None and self.pieces[7][4].filename == 'whiteking.png' and not self.pieces[7][4].hasMoved):
-				if(self.pieces[7][7] is not None and self.pieces[7][7].filename == 'blackrook.png' and not self.pieces[7][7].hasMoved):
+				if(self.pieces[7][7] is not None and self.pieces[7][7].filename == 'whiterook.png' and not self.pieces[7][7].hasMoved):
 					return 1
 			return 0
 
@@ -200,7 +200,7 @@ class Board:
 			return True
 		if(king.y < 6 and king.x < 7 and self.pieces[king.y + 2][king.x + 1] is not None and type(self.pieces[king.y + 2][king.x + 1]) is Knight and self.pieces[king.y + 2][king.x + 1].white != white):
 			return True
-		if(king.y < 6 and king.y > 0 and self.pieces[king.y + 2][king.x - 1] is not None and type(self.pieces[king.y + 2][king.x - 1]) is Knight and self.pieces[king.y + 2][king.x - 1].white != white):
+		if(king.y < 6 and king.x > 0 and self.pieces[king.y + 2][king.x - 1] is not None and type(self.pieces[king.y + 2][king.x - 1]) is Knight and self.pieces[king.y + 2][king.x - 1].white != white):
 			return True
 		if(king.y < 7 and king.x > 1 and self.pieces[king.y + 1][king.x - 2] is not None and type(self.pieces[king.y + 1][king.x - 2]) is Knight and self.pieces[king.y + 1][king.x - 2].white != white):
 			return True
@@ -219,7 +219,7 @@ class Board:
 				if(self.pieces[king.y - 1][king.x - 1] is not None and type(self.pieces[king.y - 1][king.x - 1]) is Pawn and self.pieces[king.y - 1][king.x - 1].white != white):
 					return True
 			if(king.y - 1 > -1 and king.x + 1 < 8):
-				if(self.pieces[king.y - 1][king.x + 1] is not None and type(self.pieces[king.y - 1][king.x - 1]) is Pawn and self.pieces[king.y - 1][king.x + 1].white != white):
+				if(self.pieces[king.y - 1][king.x + 1] is not None and type(self.pieces[king.y - 1][king.x + 1]) is Pawn and self.pieces[king.y - 1][king.x + 1].white != white):
 					return True
 
 		else:
@@ -299,9 +299,9 @@ class Board:
 					for b in range(0, 8):
 						if(x == b and y == a):
 							continue
-						snapshot = copy.deepcopy(self.pieces)
+						snapshot = copy.deepcopy(self.pieces), self.turn
 						if(self.makeMove(x, y, b, a)):
 							curr = [y, x, a, b]
 							res.append(curr)
-							self.pieces = snapshot
+							self.pieces, self.turn = snapshot
 		return res

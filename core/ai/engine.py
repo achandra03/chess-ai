@@ -1,149 +1,179 @@
-import sys
-import os
-sys.path.append(os.path.abspath('../game'))
-from board import Board
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import backend as K
-from tensorflow.keras import layers
-import numpy as np
 import copy
+from pathlib import Path
+
+import numpy as np
+import tensorflow as tf
+
+from position_encoding import FEATURE_SIZE, encode_board
+
+
+MATE_SCORE = 100000.0
+
 
 class Engine:
-	
-
-	def __init__(self, board):
-		self.encoder = keras.models.load_model('encoder_model')
-		self.func = K.function([self.encoder.get_layer(index=0).input], self.encoder.get_layer(index=2).output)
+	def __init__(self, board, model_path=None, depth=3):
 		self.board = board
-		self.nn = tf.keras.models.load_model("my_model_v2")
-		self.WHITE_KING = 0
-		self.WHITE_QUEEN = 1
-		self.WHITE_ROOK = 2
-		self.WHITE_BISHOP = 3
-		self.WHITE_KNIGHT = 4
-		self.WHITE_PAWN = 5 
+		self.depth = depth
+		self.model_path = self._resolve_model_path(model_path)
+		self.nn, self.model_kind = self._load_model(self.model_path)
+		self.model_input_size = self._model_input_size(self.nn, self.model_kind)
+		self.encoder = None
 
-		self.BLACK_KING = 6
-		self.BLACK_QUEEN = 7
-		self.BLACK_ROOK = 8
-		self.BLACK_BISHOP = 9
-		self.BLACK_KNIGHT = 10
-		self.BLACK_PAWN = 11
+		if self.model_input_size == 128:
+			self.encoder = tf.saved_model.load(str(Path(__file__).resolve().parent / "encoder_model"))
+		elif self.model_input_size not in (None, FEATURE_SIZE):
+			raise ValueError(
+				f"unsupported evaluator input size {self.model_input_size}; "
+				f"expected {FEATURE_SIZE} or legacy 128"
+			)
 
-		self.PIECE_TO_POSITION = {'K': self.WHITE_KING, 'Q': self.WHITE_QUEEN, 'R': self.WHITE_ROOK, 'B': self.WHITE_BISHOP, 'N': self.WHITE_KNIGHT, 'P': self.WHITE_PAWN, 'k': self.BLACK_KING, 'q': self.BLACK_QUEEN, 'r': self.BLACK_ROOK, 'b': self.BLACK_BISHOP, 'n': self.BLACK_KNIGHT, 'p': self.BLACK_PAWN}
+	def _resolve_model_path(self, model_path):
+		if model_path is not None:
+			path = Path(model_path)
+			if not path.exists():
+				raise FileNotFoundError(path)
+			return path
 
-	def inv_sigmoid(self, x):
-		return np.log(x / (1 - x))
+		model_dir = Path(__file__).resolve().parent
+		for name in ("position_evaluator.keras", "position_evaluator", "my_model_v2"):
+			path = model_dir / name
+			if path.exists():
+				return path
+		raise FileNotFoundError("no evaluator model found in core/ai")
 
-	def nn_input(self, white):
-		imboard = []
-		for i in range(8):
-			curr = []
-			for j in range(8):
-				c = [0 for i in range(12)]
-				curr.append(c)
-			imboard.append(curr)
-				
+	def _load_model(self, path):
+		try:
+			return tf.keras.models.load_model(str(path), compile=False), "keras"
+		except Exception:
+			return tf.saved_model.load(str(path)), "saved_model"
 
-		for row in self.board.pieces:
-			for piece in row:
-				if(piece is None):
-					continue
+	def _model_input_size(self, model, model_kind):
+		if model_kind == "keras":
+			input_shape = model.input_shape
+			if isinstance(input_shape, list):
+				input_shape = input_shape[0]
+			if input_shape is not None and input_shape[-1] is not None:
+				return int(input_shape[-1])
 
-				if(piece.white != white):
-					imboard[piece.y][piece.x][self.PIECE_TO_POSITION[piece.symbol]] = -1
-				else:
-					imboard[piece.y][piece.x][self.PIECE_TO_POSITION[piece.symbol]] = 1
+		signature = getattr(model, "signatures", {}).get("serving_default")
+		if signature is not None:
+			_, kwargs = signature.structured_input_signature
+			for spec in kwargs.values():
+				if spec.shape[-1] is not None:
+					return int(spec.shape[-1])
 
+		first_layer = getattr(model, "layer-0", None)
+		if first_layer is not None:
+			for variable in first_layer.variables:
+				if "kernel" in variable.name and len(variable.shape) >= 2:
+					return int(variable.shape[0])
 
-		imboard = np.array(imboard)
-		imboard = imboard.flatten()
-		imboard = np.append(imboard, [0 for i in range(7)])
+		if self.model_path.name == "my_model_v2":
+			return 128
+		return FEATURE_SIZE
 
-		imboard[768] = int(self.board.turn)
-		if(self.board.checked(True) and self.board.turn == 1):
-			imboard[769] = 1
-		elif(self.board.checked(False) and self.board.turn == 0):
-				imboard[770] = 1
-		imboard[771] = int(self.board.has_kingside_castling_rights(1))
-		imboard[772] = int(self.board.has_queenside_castling_rights(1))
-		imboard[773] = int(self.board.has_kingside_castling_rights(0))
-		imboard[774] = int(self.board.has_queenside_castling_rights(0))
+	def _run_layers(self, model, inp, stop_layer):
+		out = tf.convert_to_tensor(inp, dtype=tf.float32)
+		for idx in range(stop_layer + 1):
+			out = getattr(model, f"layer-{idx}")(out)
+		return out
 
+	def _predict_model(self, inp):
+		inp = tf.convert_to_tensor(inp, dtype=tf.float32)
+		if self.model_kind == "keras":
+			return self.nn(inp, training=False)
 
-		imboard = imboard.reshape((-1, 775))
-		return self.func([imboard])
+		signature = getattr(self.nn, "signatures", {}).get("serving_default")
+		if signature is not None:
+			_, kwargs = signature.structured_input_signature
+			if kwargs:
+				input_name = next(iter(kwargs))
+				outputs = signature(**{input_name: inp})
+			else:
+				outputs = signature(inp)
+			return next(iter(outputs.values()))
 
+		return self._run_layers(self.nn, inp, 3)
 
-	def eval_position(self, white):
-		inp = self.nn_input(white)
-		eva = self.nn(inp)
-		return eva
+	def nn_input(self):
+		features = encode_board(self.board).reshape(1, FEATURE_SIZE)
+		if self.model_input_size == 128:
+			return self._run_layers(self.encoder, features, 2)
+		return features
 
+	def eval_position(self):
+		eval_tensor = self._predict_model(self.nn_input())
+		return float(np.asarray(eval_tensor)[0][0])
 
-	def minimax(self, depth, maximize, alpha, beta):
-		if(depth == 0):
-			return self.eval_position(maximize), None
+	def eval_position_for(self, root_white):
+		side_to_move_is_white = self.board.turn == 0
+		score = self.eval_position()
+		if side_to_move_is_white == root_white:
+			return score
+		return -score
 
-		moves = self.board.allMoves(maximize)
-		if(maximize):
-			best = -100000000
-			ret = None
+	def snapshot_board(self):
+		return copy.deepcopy(self.board.pieces), self.board.turn
+
+	def restore_board(self, snapshot):
+		self.board.pieces, self.board.turn = snapshot
+
+	def terminal_eval_for(self, root_white):
+		side_to_move_is_white = self.board.turn == 0
+		if self.board.checked(side_to_move_is_white):
+			if side_to_move_is_white == root_white:
+				return -MATE_SCORE
+			return MATE_SCORE
+		return 0.0
+
+	def minimax(self, depth, root_white, alpha, beta):
+		if depth == 0:
+			return self.eval_position_for(root_white), None
+
+		side_to_move_is_white = self.board.turn == 0
+		moves = self.board.allMoves(side_to_move_is_white)
+		if len(moves) == 0:
+			return self.terminal_eval_for(root_white), None
+
+		if side_to_move_is_white == root_white:
+			best = -MATE_SCORE
+			best_move = None
 			for move in moves:
-				y = move[0]
-				x = move[1]
-				newY = move[2]
-				newX = move[3]
-				snapshot = copy.deepcopy(self.board.pieces)
+				y, x, newY, newX = move
+				snapshot = self.snapshot_board()
 				self.board.makeMove(x, y, newX, newY)
-				val, _ = self.minimax(depth - 1, False, alpha, beta)
-				self.board.pieces = snapshot
-				if(val > best):
-					best = val
-					ret = move
+				value, _ = self.minimax(depth - 1, root_white, alpha, beta)
+				self.restore_board(snapshot)
+
+				if value > best:
+					best = value
+					best_move = move
 				alpha = max(alpha, best)
-				if(beta <= alpha):
+				if alpha >= beta:
 					break
+			return best, best_move
 
-			return best, ret
-
-		else:
-			best = 100000000
-			ret = None
-			for move in moves:
-				y = move[0]
-				x = move[1]
-				newY = move[2]
-				newX = move[3]
-				snapshot = copy.deepcopy(self.board.pieces)
-				self.board.makeMove(x, y, newX, newY)
-				val, _ = self.minimax(depth - 1, True, alpha, beta)
-				self.board.pieces = snapshot
-				if(val < best):
-					best = val
-					ret = move
-				beta = min(beta, best)
-				if(beta <= alpha):
-					break
-			return best, ret
-
-	def selectMove(self):
-		moves = self.board.allMoves(False)
-		bestEval = 1000
-		bestMove = None
+		best = MATE_SCORE
+		best_move = None
 		for move in moves:
-			y = move[0]
-			x = move[1]
-			newY = move[2]
-			newX = move[3]
-			snapshot = copy.deepcopy(self.board.pieces)
+			y, x, newY, newX = move
+			snapshot = self.snapshot_board()
 			self.board.makeMove(x, y, newX, newY)
-			newEval = self.eval_position(False)
-			if(newEval < bestEval):
-				bestEval = newEval
-				bestMove = move
-			self.board.pieces = snapshot
-		print(bestEval)
-		return bestMove
+			value, _ = self.minimax(depth - 1, root_white, alpha, beta)
+			self.restore_board(snapshot)
 
+			if value < best:
+				best = value
+				best_move = move
+			beta = min(beta, best)
+			if alpha >= beta:
+				break
+		return best, best_move
+
+	def selectMove(self, white=None):
+		if white is not None and white != (self.board.turn == 0):
+			raise ValueError("selectMove side does not match board.turn")
+		root_white = self.board.turn == 0
+		best_eval, best_move = self.minimax(self.depth, root_white, -MATE_SCORE, MATE_SCORE)
+		print(best_eval)
+		return best_move
