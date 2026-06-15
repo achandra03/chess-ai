@@ -3,6 +3,5 @@
 data/
 *.zip
 *.h5
-*.keras
 *.pyc
 *.swp
