@@ -35,7 +35,12 @@ class Engine:
 			return path
 
 		model_dir = Path(__file__).resolve().parent
-		for name in ("position_evaluator.keras", "position_evaluator", "my_model_v2"):
+		for name in (
+			"position_evaluator_cnn.keras",
+			"position_evaluator.keras",
+			"position_evaluator",
+			"my_model_v2",
+		):
 			path = model_dir / name
 			if path.exists():
 				return path

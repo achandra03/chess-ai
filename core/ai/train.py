@@ -21,7 +21,10 @@ DEFAULT_DATA_FILES = [
 	DATA_DIR / "random_evals.csv",
 	DATA_DIR / "tactic_evals.csv",
 ]
-DEFAULT_MODEL_OUT = AI_DIR / "position_evaluator.keras"
+DEFAULT_CNN_MODEL_OUT = AI_DIR / "position_evaluator_cnn.keras"
+DEFAULT_CNN_WEIGHTS_OUT = AI_DIR / "position_evaluator_cnn.weights.h5"
+DEFAULT_MLP_MODEL_OUT = AI_DIR / "position_evaluator.keras"
+DEFAULT_MLP_WEIGHTS_OUT = AI_DIR / "position_evaluator.weights.h5"
 
 
 def parse_args():
@@ -36,8 +39,20 @@ def parse_args():
 	parser.add_argument(
 		"--model-out",
 		type=Path,
-		default=DEFAULT_MODEL_OUT,
+		default=None,
 		help="Path for the trained Keras evaluator.",
+	)
+	parser.add_argument(
+		"--weights-out",
+		type=Path,
+		default=None,
+		help="Optional path for best weights-only checkpoint.",
+	)
+	parser.add_argument(
+		"--architecture",
+		choices=("cnn", "mlp"),
+		default="cnn",
+		help="Evaluator architecture to train.",
 	)
 	parser.add_argument("--epochs", type=int, default=40)
 	parser.add_argument("--batch-size", type=int, default=2048)
@@ -101,6 +116,20 @@ def configure_tensorflow():
 			pass
 
 
+def resolve_output_paths(args):
+	if args.model_out is None:
+		if args.architecture == "cnn":
+			args.model_out = DEFAULT_CNN_MODEL_OUT
+		else:
+			args.model_out = DEFAULT_MLP_MODEL_OUT
+
+	if args.weights_out is None:
+		if args.architecture == "cnn":
+			args.weights_out = DEFAULT_CNN_WEIGHTS_OUT
+		else:
+			args.weights_out = DEFAULT_MLP_WEIGHTS_OUT
+
+
 @tf.keras.utils.register_keras_serializable(package="ChessAI")
 class TargetRangeMAE(tf.keras.metrics.Metric):
 	def __init__(self, min_abs=None, max_abs=None, name="target_range_mae", **kwargs):
@@ -138,7 +167,22 @@ class TargetRangeMAE(tf.keras.metrics.Metric):
 		return config
 
 
-def build_model(learning_rate):
+def compile_model(model, learning_rate):
+	model.compile(
+		optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=1.0),
+		loss=tf.keras.losses.Huber(delta=1.0),
+		metrics=[
+			tf.keras.metrics.MeanAbsoluteError(name="mae"),
+			TargetRangeMAE(max_abs=1.0, name="mae_abs_le_1"),
+			TargetRangeMAE(max_abs=3.0, name="mae_abs_le_3"),
+			TargetRangeMAE(max_abs=5.0, name="mae_abs_le_5"),
+			TargetRangeMAE(min_abs=5.0, name="mae_abs_gt_5"),
+		],
+	)
+	return model
+
+
+def build_mlp_model(learning_rate):
 	inputs = tf.keras.Input(shape=(FEATURE_SIZE,), name="position")
 	x = tf.keras.layers.Dense(
 		1024,
@@ -156,18 +200,99 @@ def build_model(learning_rate):
 	outputs = tf.keras.layers.Dense(1, name="side_to_move_pawn_score")(x)
 
 	model = tf.keras.Model(inputs=inputs, outputs=outputs, name="position_evaluator")
-	model.compile(
-		optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=1.0),
-		loss=tf.keras.losses.Huber(delta=1.0),
-		metrics=[
-			tf.keras.metrics.MeanAbsoluteError(name="mae"),
-			TargetRangeMAE(max_abs=1.0, name="mae_abs_le_1"),
-			TargetRangeMAE(max_abs=3.0, name="mae_abs_le_3"),
-			TargetRangeMAE(max_abs=5.0, name="mae_abs_le_5"),
-			TargetRangeMAE(min_abs=5.0, name="mae_abs_gt_5"),
-		],
+	return compile_model(model, learning_rate)
+
+
+def residual_block(x, filters, name):
+	shortcut = x
+	x = tf.keras.layers.Conv2D(
+		filters,
+		kernel_size=3,
+		padding="same",
+		use_bias=False,
+		kernel_regularizer=tf.keras.regularizers.l2(1e-5),
+		name=f"{name}_conv_1",
+	)(x)
+	x = tf.keras.layers.BatchNormalization(name=f"{name}_bn_1")(x)
+	x = tf.keras.layers.Activation("relu", name=f"{name}_relu_1")(x)
+	x = tf.keras.layers.Conv2D(
+		filters,
+		kernel_size=3,
+		padding="same",
+		use_bias=False,
+		kernel_regularizer=tf.keras.regularizers.l2(1e-5),
+		name=f"{name}_conv_2",
+	)(x)
+	x = tf.keras.layers.BatchNormalization(name=f"{name}_bn_2")(x)
+
+	if shortcut.shape[-1] != filters:
+		shortcut = tf.keras.layers.Conv2D(
+			filters,
+			kernel_size=1,
+			padding="same",
+			use_bias=False,
+			kernel_regularizer=tf.keras.regularizers.l2(1e-5),
+			name=f"{name}_projection",
+		)(shortcut)
+		shortcut = tf.keras.layers.BatchNormalization(name=f"{name}_projection_bn")(shortcut)
+
+	x = tf.keras.layers.Add(name=f"{name}_add")([shortcut, x])
+	return tf.keras.layers.Activation("relu", name=f"{name}_relu_2")(x)
+
+
+def build_cnn_model(learning_rate):
+	inputs = tf.keras.Input(shape=(FEATURE_SIZE,), name="position")
+	sequence = tf.keras.layers.Reshape((FEATURE_SIZE, 1), name="feature_sequence")(inputs)
+
+	board = tf.keras.layers.Cropping1D(cropping=(0, 7), name="board_feature_slice")(sequence)
+	board = tf.keras.layers.Reshape((8, 8, 12), name="board_planes")(board)
+
+	metadata = tf.keras.layers.Cropping1D(cropping=(768, 0), name="metadata_feature_slice")(sequence)
+	metadata = tf.keras.layers.Flatten(name="metadata_flatten")(metadata)
+	metadata = tf.keras.layers.Dense(64, activation="relu", name="metadata_dense")(metadata)
+
+	x = tf.keras.layers.Conv2D(
+		64,
+		kernel_size=3,
+		padding="same",
+		use_bias=False,
+		kernel_regularizer=tf.keras.regularizers.l2(1e-5),
+		name="stem_conv",
+	)(board)
+	x = tf.keras.layers.BatchNormalization(name="stem_bn")(x)
+	x = tf.keras.layers.Activation("relu", name="stem_relu")(x)
+
+	x = residual_block(x, 64, "res_64_1")
+	x = residual_block(x, 64, "res_64_2")
+	x = residual_block(x, 128, "res_128_1")
+	x = residual_block(x, 128, "res_128_2")
+
+	spatial = tf.keras.layers.Flatten(name="spatial_flatten")(x)
+	x = tf.keras.layers.Concatenate(name="spatial_metadata")([spatial, metadata])
+	x = tf.keras.layers.Dense(
+		512,
+		activation="relu",
+		kernel_regularizer=tf.keras.regularizers.l2(1e-5),
+		name="value_dense_1",
+	)(x)
+	x = tf.keras.layers.Dropout(0.15, name="value_dropout")(x)
+	x = tf.keras.layers.Dense(128, activation="relu", name="value_dense_2")(x)
+	outputs = tf.keras.layers.Dense(1, name="side_to_move_pawn_score")(x)
+
+	model = tf.keras.Model(
+		inputs=inputs,
+		outputs=outputs,
+		name="position_evaluator_cnn",
 	)
-	return model
+	return compile_model(model, learning_rate)
+
+
+def build_model(architecture, learning_rate):
+	if architecture == "cnn":
+		return build_cnn_model(learning_rate)
+	if architecture == "mlp":
+		return build_mlp_model(learning_rate)
+	raise ValueError(f"unsupported architecture: {architecture}")
 
 
 def is_validation_fen(fen, validation_fraction, split_seed):
@@ -295,6 +420,8 @@ def validate_args(args):
 		raise ValueError("--steps-per-epoch must be positive")
 	if args.validation_steps is not None and args.validation_steps < 1:
 		raise ValueError("--validation-steps must be positive")
+	if args.weights_out is not None and not str(args.weights_out).endswith(".weights.h5"):
+		raise ValueError("--weights-out must end with .weights.h5")
 
 	for path in args.data_files:
 		if not path.exists():
@@ -303,6 +430,7 @@ def validate_args(args):
 
 def main():
 	args = parse_args()
+	resolve_output_paths(args)
 	validate_args(args)
 	configure_tensorflow()
 
@@ -318,6 +446,9 @@ def main():
 	if train_rows == 0:
 		raise ValueError("no training rows available")
 
+	print(f"Architecture: {args.architecture}")
+	print(f"Model checkpoint: {args.model_out}")
+	print(f"Weights checkpoint: {args.weights_out}")
 	print(f"Split: deterministic FEN hash ({args.validation_fraction:.1%} validation)")
 	if args.focus_loss_pawns > 0:
 		print(
@@ -349,8 +480,10 @@ def main():
 			)
 		return
 
-	model = build_model(args.learning_rate)
+	model = build_model(args.architecture, args.learning_rate)
 	args.model_out.parent.mkdir(parents=True, exist_ok=True)
+	if args.weights_out is not None:
+		args.weights_out.parent.mkdir(parents=True, exist_ok=True)
 
 	steps_per_epoch = math.ceil(train_rows / args.batch_size)
 	if args.steps_per_epoch is not None:
@@ -369,6 +502,15 @@ def main():
 			save_best_only=True,
 		),
 	]
+	if args.weights_out is not None:
+		callbacks.append(
+			tf.keras.callbacks.ModelCheckpoint(
+				filepath=str(args.weights_out),
+				monitor="val_loss" if validation_dataset is not None else "loss",
+				save_best_only=True,
+				save_weights_only=True,
+			)
+		)
 
 	model.fit(
 		train_dataset,
@@ -379,6 +521,8 @@ def main():
 		callbacks=callbacks,
 	)
 	print(f"Saved best evaluator checkpoint to {args.model_out}")
+	if args.weights_out is not None:
+		print(f"Saved best weights checkpoint to {args.weights_out}")
 
 
 if __name__ == "__main__":
