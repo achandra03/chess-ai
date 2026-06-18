@@ -16,7 +16,15 @@ PIECE_PLANES = {
 	"q": 10,
 	"k": 11,
 }
-FEATURE_SIZE = BOARD_SIZE * BOARD_SIZE * len(PIECE_PLANES) + 7
+METADATA_SIZE = 7
+PIECE_PLANE_COUNT = len(PIECE_PLANES)
+ATTACK_PLANE_COUNT = len(PIECE_PLANES)
+BOARD_FEATURE_SIZE = BOARD_SIZE * BOARD_SIZE * PIECE_PLANE_COUNT
+ATTACK_BOARD_FEATURE_SIZE = BOARD_SIZE * BOARD_SIZE * (
+	PIECE_PLANE_COUNT + ATTACK_PLANE_COUNT
+)
+FEATURE_SIZE = BOARD_FEATURE_SIZE + METADATA_SIZE
+ATTACK_FEATURE_SIZE = ATTACK_BOARD_FEATURE_SIZE + METADATA_SIZE
 
 
 def evaluation_to_pawns(evaluation, max_abs_pawns=10.0):
@@ -35,8 +43,8 @@ def evaluation_to_pawns(evaluation, max_abs_pawns=10.0):
 	return float(np.clip(score, -max_abs_pawns, max_abs_pawns))
 
 
-def encode_fen(fen):
-	"""Encode a FEN string into the 775-feature input used by the evaluator."""
+def encode_fen(fen, include_attack_maps=False):
+	"""Encode a FEN string for either the base or attack-map evaluator."""
 	fields = str(fen).strip().split()
 	if len(fields) < 4:
 		raise ValueError(f"invalid FEN: {fen}")
@@ -55,10 +63,11 @@ def encode_fen(fen):
 			"k": "k" in castling,
 			"q": "q" in castling,
 		},
+		include_attack_maps=include_attack_maps,
 	)
 
 
-def encode_board(board):
+def encode_board(board, include_attack_maps=False):
 	"""Encode the project's live Board object with the same schema as encode_fen."""
 	board_symbols = [[None for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
 	for row in board.pieces:
@@ -71,6 +80,7 @@ def encode_board(board):
 		board_symbols=board_symbols,
 		white_to_move=_board_white_to_move(board),
 		castling_rights=_board_castling_rights(board),
+		include_attack_maps=include_attack_maps,
 	)
 
 
@@ -97,25 +107,106 @@ def _symbols_from_fen_board(board_part):
 	return board_symbols
 
 
-def _encode_symbols(board_symbols, white_to_move, castling_rights):
-	features = np.zeros(FEATURE_SIZE, dtype=np.float32)
-	piece_features = np.zeros((BOARD_SIZE, BOARD_SIZE, len(PIECE_PLANES)), dtype=np.float32)
+def _encode_symbols(board_symbols, white_to_move, castling_rights, include_attack_maps):
+	plane_count = PIECE_PLANE_COUNT
+	feature_size = FEATURE_SIZE
+	if include_attack_maps:
+		plane_count += ATTACK_PLANE_COUNT
+		feature_size = ATTACK_FEATURE_SIZE
+
+	features = np.zeros(feature_size, dtype=np.float32)
+	board_features = np.zeros((BOARD_SIZE, BOARD_SIZE, plane_count), dtype=np.float32)
 
 	for y, row in enumerate(board_symbols):
 		for x, symbol in enumerate(row):
 			if symbol is None:
 				continue
-			piece_features[y, x, PIECE_PLANES[symbol]] = 1.0
+			board_features[y, x, PIECE_PLANES[symbol]] = 1.0
+			if include_attack_maps:
+				attack_plane = PIECE_PLANE_COUNT + PIECE_PLANES[symbol]
+				for attack_y, attack_x in _piece_attack_squares(
+					board_symbols, y, x, symbol
+				):
+					board_features[attack_y, attack_x, attack_plane] = 1.0
 
-	features[:768] = piece_features.reshape(-1)
-	features[768] = 1.0 if white_to_move else 0.0
-	features[769] = 1.0 if white_to_move and _king_in_check(board_symbols, True) else 0.0
-	features[770] = 1.0 if (not white_to_move) and _king_in_check(board_symbols, False) else 0.0
-	features[771] = 1.0 if castling_rights.get("K", False) else 0.0
-	features[772] = 1.0 if castling_rights.get("Q", False) else 0.0
-	features[773] = 1.0 if castling_rights.get("k", False) else 0.0
-	features[774] = 1.0 if castling_rights.get("q", False) else 0.0
+	board_feature_size = BOARD_SIZE * BOARD_SIZE * plane_count
+	features[:board_feature_size] = board_features.reshape(-1)
+	features[board_feature_size] = 1.0 if white_to_move else 0.0
+	features[board_feature_size + 1] = (
+		1.0 if white_to_move and _king_in_check(board_symbols, True) else 0.0
+	)
+	features[board_feature_size + 2] = (
+		1.0 if (not white_to_move) and _king_in_check(board_symbols, False) else 0.0
+	)
+	features[board_feature_size + 3] = 1.0 if castling_rights.get("K", False) else 0.0
+	features[board_feature_size + 4] = 1.0 if castling_rights.get("Q", False) else 0.0
+	features[board_feature_size + 5] = 1.0 if castling_rights.get("k", False) else 0.0
+	features[board_feature_size + 6] = 1.0 if castling_rights.get("q", False) else 0.0
 	return features
+
+
+def _piece_attack_squares(board_symbols, y, x, symbol):
+	piece_type = symbol.lower()
+
+	if piece_type == "p":
+		dy = -1 if symbol.isupper() else 1
+		return [
+			(attack_y, attack_x)
+			for attack_y, attack_x in ((y + dy, x - 1), (y + dy, x + 1))
+			if _on_board(attack_y, attack_x)
+		]
+
+	if piece_type == "n":
+		return [
+			(y + dy, x + dx)
+			for dy, dx in (
+				(-2, -1),
+				(-2, 1),
+				(-1, -2),
+				(-1, 2),
+				(1, -2),
+				(1, 2),
+				(2, -1),
+				(2, 1),
+			)
+			if _on_board(y + dy, x + dx)
+		]
+
+	if piece_type == "k":
+		return [
+			(y + dy, x + dx)
+			for dy in (-1, 0, 1)
+			for dx in (-1, 0, 1)
+			if (dy != 0 or dx != 0) and _on_board(y + dy, x + dx)
+		]
+
+	directions = []
+	if piece_type in ("r", "q"):
+		directions.extend(((-1, 0), (1, 0), (0, -1), (0, 1)))
+	if piece_type in ("b", "q"):
+		directions.extend(((-1, -1), (-1, 1), (1, -1), (1, 1)))
+
+	attacks = []
+	for dy, dx in directions:
+		attacks.extend(_ray_attack_squares(board_symbols, y, x, dy, dx))
+	return attacks
+
+
+def _ray_attack_squares(board_symbols, y, x, dy, dx):
+	attacks = []
+	y += dy
+	x += dx
+	while _on_board(y, x):
+		attacks.append((y, x))
+		if board_symbols[y][x] is not None:
+			break
+		y += dy
+		x += dx
+	return attacks
+
+
+def _on_board(y, x):
+	return 0 <= y < BOARD_SIZE and 0 <= x < BOARD_SIZE
 
 
 def _king_in_check(board_symbols, white):

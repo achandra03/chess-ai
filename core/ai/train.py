@@ -10,7 +10,16 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 import numpy as np
 import tensorflow as tf
 
-from position_encoding import FEATURE_SIZE, encode_fen, evaluation_to_pawns
+from position_encoding import (
+	ATTACK_PLANE_COUNT,
+	ATTACK_BOARD_FEATURE_SIZE,
+	ATTACK_FEATURE_SIZE,
+	FEATURE_SIZE,
+	METADATA_SIZE,
+	PIECE_PLANE_COUNT,
+	encode_fen,
+	evaluation_to_pawns,
+)
 
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -21,8 +30,8 @@ DEFAULT_DATA_FILES = [
 	DATA_DIR / "random_evals.csv",
 	DATA_DIR / "tactic_evals.csv",
 ]
-DEFAULT_CNN_MODEL_OUT = AI_DIR / "position_evaluator_cnn.keras"
-DEFAULT_CNN_WEIGHTS_OUT = AI_DIR / "position_evaluator_cnn.weights.h5"
+DEFAULT_CNN_MODEL_OUT = AI_DIR / "position_evaluator_cnn_attacks.keras"
+DEFAULT_CNN_WEIGHTS_OUT = AI_DIR / "position_evaluator_cnn_attacks.weights.h5"
 DEFAULT_MLP_MODEL_OUT = AI_DIR / "position_evaluator.keras"
 DEFAULT_MLP_WEIGHTS_OUT = AI_DIR / "position_evaluator.weights.h5"
 
@@ -241,13 +250,21 @@ def residual_block(x, filters, name):
 
 
 def build_cnn_model(learning_rate):
-	inputs = tf.keras.Input(shape=(FEATURE_SIZE,), name="position")
-	sequence = tf.keras.layers.Reshape((FEATURE_SIZE, 1), name="feature_sequence")(inputs)
+	inputs = tf.keras.Input(shape=(ATTACK_FEATURE_SIZE,), name="position")
+	sequence = tf.keras.layers.Reshape(
+		(ATTACK_FEATURE_SIZE, 1), name="feature_sequence"
+	)(inputs)
 
-	board = tf.keras.layers.Cropping1D(cropping=(0, 7), name="board_feature_slice")(sequence)
-	board = tf.keras.layers.Reshape((8, 8, 12), name="board_planes")(board)
+	board = tf.keras.layers.Cropping1D(
+		cropping=(0, METADATA_SIZE), name="board_feature_slice"
+	)(sequence)
+	board = tf.keras.layers.Reshape(
+		(8, 8, PIECE_PLANE_COUNT + ATTACK_PLANE_COUNT), name="board_planes"
+	)(board)
 
-	metadata = tf.keras.layers.Cropping1D(cropping=(768, 0), name="metadata_feature_slice")(sequence)
+	metadata = tf.keras.layers.Cropping1D(
+		cropping=(ATTACK_BOARD_FEATURE_SIZE, 0), name="metadata_feature_slice"
+	)(sequence)
 	metadata = tf.keras.layers.Flatten(name="metadata_flatten")(metadata)
 	metadata = tf.keras.layers.Dense(64, activation="relu", name="metadata_dense")(metadata)
 
@@ -282,7 +299,7 @@ def build_cnn_model(learning_rate):
 	model = tf.keras.Model(
 		inputs=inputs,
 		outputs=outputs,
-		name="position_evaluator_cnn",
+		name="position_evaluator_cnn_attacks",
 	)
 	return compile_model(model, learning_rate)
 
@@ -343,6 +360,7 @@ def iter_examples(
 	paths,
 	row_counts,
 	split,
+	include_attack_maps,
 	max_abs_pawns,
 	validation_fraction,
 	split_seed,
@@ -366,7 +384,9 @@ def iter_examples(
 				if split == "validation" and not is_validation:
 					continue
 
-				features = encode_fen(row["FEN"])
+				features = encode_fen(
+					row["FEN"], include_attack_maps=include_attack_maps
+				)
 				target = evaluation_to_pawns(row["Evaluation"], max_abs_pawns=max_abs_pawns)
 				weight = sample_weight_for_target(
 					target=target,
@@ -377,11 +397,14 @@ def iter_examples(
 
 
 def make_dataset(paths, row_counts, split, args):
+	include_attack_maps = args.architecture == "cnn"
+	feature_size = ATTACK_FEATURE_SIZE if include_attack_maps else FEATURE_SIZE
 	dataset = tf.data.Dataset.from_generator(
 		lambda: iter_examples(
 			paths=paths,
 			row_counts=row_counts,
 			split=split,
+			include_attack_maps=include_attack_maps,
 			max_abs_pawns=args.max_abs_pawns,
 			validation_fraction=args.validation_fraction,
 			split_seed=args.split_seed,
@@ -389,7 +412,7 @@ def make_dataset(paths, row_counts, split, args):
 			min_sample_weight=args.min_sample_weight,
 		),
 		output_signature=(
-			tf.TensorSpec(shape=(FEATURE_SIZE,), dtype=tf.float32),
+			tf.TensorSpec(shape=(feature_size,), dtype=tf.float32),
 			tf.TensorSpec(shape=(1,), dtype=tf.float32),
 			tf.TensorSpec(shape=(), dtype=tf.float32),
 		),
@@ -447,6 +470,10 @@ def main():
 		raise ValueError("no training rows available")
 
 	print(f"Architecture: {args.architecture}")
+	print(
+		f"Input features: "
+		f"{ATTACK_FEATURE_SIZE if args.architecture == 'cnn' else FEATURE_SIZE}"
+	)
 	print(f"Model checkpoint: {args.model_out}")
 	print(f"Weights checkpoint: {args.weights_out}")
 	print(f"Split: deterministic FEN hash ({args.validation_fraction:.1%} validation)")
