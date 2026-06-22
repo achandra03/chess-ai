@@ -25,6 +25,16 @@ ATTACK_BOARD_FEATURE_SIZE = BOARD_SIZE * BOARD_SIZE * (
 )
 FEATURE_SIZE = BOARD_FEATURE_SIZE + METADATA_SIZE
 ATTACK_FEATURE_SIZE = ATTACK_BOARD_FEATURE_SIZE + METADATA_SIZE
+PERSPECTIVE_METADATA_SIZE = 6
+PERSPECTIVE_FEATURE_SIZE = ATTACK_BOARD_FEATURE_SIZE + PERSPECTIVE_METADATA_SIZE
+RELATIVE_PIECE_PLANES = {
+	"p": 0,
+	"r": 1,
+	"n": 2,
+	"b": 3,
+	"q": 4,
+	"k": 5,
+}
 
 
 def evaluation_to_pawns(evaluation, max_abs_pawns=10.0):
@@ -81,6 +91,45 @@ def encode_board(board, include_attack_maps=False):
 		white_to_move=_board_white_to_move(board),
 		castling_rights=_board_castling_rights(board),
 		include_attack_maps=include_attack_maps,
+	)
+
+
+def encode_fen_perspective(fen, mirror_files=False):
+	"""Encode a FEN with the side to move represented as the first player."""
+	fields = str(fen).strip().split()
+	if len(fields) < 4:
+		raise ValueError(f"invalid FEN: {fen}")
+
+	board_part, turn, castling = fields[0], fields[1], fields[2]
+	if turn not in ("w", "b"):
+		raise ValueError(f"invalid FEN turn field: {turn}")
+
+	return _encode_perspective_symbols(
+		board_symbols=_symbols_from_fen_board(board_part),
+		white_to_move=(turn == "w"),
+		castling_rights={
+			"K": "K" in castling,
+			"Q": "Q" in castling,
+			"k": "k" in castling,
+			"q": "q" in castling,
+		},
+		mirror_files=mirror_files,
+	)
+
+
+def encode_board_perspective(board):
+	"""Encode a live board from the side-to-move player's perspective."""
+	board_symbols = [[None for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
+	for row in board.pieces:
+		for piece in row:
+			if piece is not None:
+				board_symbols[piece.y][piece.x] = piece.symbol
+
+	return _encode_perspective_symbols(
+		board_symbols=board_symbols,
+		white_to_move=_board_white_to_move(board),
+		castling_rights=_board_castling_rights(board),
+		mirror_files=False,
 	)
 
 
@@ -142,6 +191,55 @@ def _encode_symbols(board_symbols, white_to_move, castling_rights, include_attac
 	features[board_feature_size + 4] = 1.0 if castling_rights.get("Q", False) else 0.0
 	features[board_feature_size + 5] = 1.0 if castling_rights.get("k", False) else 0.0
 	features[board_feature_size + 6] = 1.0 if castling_rights.get("q", False) else 0.0
+	return features
+
+
+def _encode_perspective_symbols(
+	board_symbols, white_to_move, castling_rights, mirror_files
+):
+	board_features = np.zeros(
+		(BOARD_SIZE, BOARD_SIZE, PIECE_PLANE_COUNT + ATTACK_PLANE_COUNT),
+		dtype=np.float32,
+	)
+
+	for y, row in enumerate(board_symbols):
+		for x, symbol in enumerate(row):
+			if symbol is None:
+				continue
+
+			piece_is_white = symbol.isupper()
+			player_offset = 0 if piece_is_white == white_to_move else 6
+			piece_plane = player_offset + RELATIVE_PIECE_PLANES[symbol.lower()]
+			feature_y = y if white_to_move else BOARD_SIZE - 1 - y
+			feature_x = BOARD_SIZE - 1 - x if mirror_files else x
+			board_features[feature_y, feature_x, piece_plane] = 1.0
+
+			attack_plane = PIECE_PLANE_COUNT + piece_plane
+			for attack_y, attack_x in _piece_attack_squares(
+				board_symbols, y, x, symbol
+			):
+				feature_attack_y = (
+					attack_y if white_to_move else BOARD_SIZE - 1 - attack_y
+				)
+				feature_attack_x = (
+					BOARD_SIZE - 1 - attack_x if mirror_files else attack_x
+				)
+				board_features[
+					feature_attack_y, feature_attack_x, attack_plane
+				] = 1.0
+
+	features = np.zeros(PERSPECTIVE_FEATURE_SIZE, dtype=np.float32)
+	features[:ATTACK_BOARD_FEATURE_SIZE] = board_features.reshape(-1)
+	metadata = features[ATTACK_BOARD_FEATURE_SIZE:]
+	metadata[0] = 1.0 if _king_in_check(board_symbols, white_to_move) else 0.0
+	metadata[1] = 1.0 if _king_in_check(board_symbols, not white_to_move) else 0.0
+
+	if white_to_move:
+		castling_keys = ("K", "Q", "k", "q")
+	else:
+		castling_keys = ("k", "q", "K", "Q")
+	for index, key in enumerate(castling_keys, start=2):
+		metadata[index] = 1.0 if castling_rights.get(key, False) else 0.0
 	return features
 
 

@@ -13,11 +13,12 @@ import tensorflow as tf
 from position_encoding import (
 	ATTACK_PLANE_COUNT,
 	ATTACK_BOARD_FEATURE_SIZE,
-	ATTACK_FEATURE_SIZE,
 	FEATURE_SIZE,
-	METADATA_SIZE,
+	PERSPECTIVE_FEATURE_SIZE,
+	PERSPECTIVE_METADATA_SIZE,
 	PIECE_PLANE_COUNT,
 	encode_fen,
+	encode_fen_perspective,
 	evaluation_to_pawns,
 )
 
@@ -30,8 +31,8 @@ DEFAULT_DATA_FILES = [
 	DATA_DIR / "random_evals.csv",
 	DATA_DIR / "tactic_evals.csv",
 ]
-DEFAULT_CNN_MODEL_OUT = AI_DIR / "position_evaluator_cnn_attacks.keras"
-DEFAULT_CNN_WEIGHTS_OUT = AI_DIR / "position_evaluator_cnn_attacks.weights.h5"
+DEFAULT_CNN_MODEL_OUT = AI_DIR / "position_evaluator_cnn_v2.keras"
+DEFAULT_CNN_WEIGHTS_OUT = AI_DIR / "position_evaluator_cnn_v2.weights.h5"
 DEFAULT_MLP_MODEL_OUT = AI_DIR / "position_evaluator.keras"
 DEFAULT_MLP_WEIGHTS_OUT = AI_DIR / "position_evaluator.weights.h5"
 
@@ -66,6 +67,11 @@ def parse_args():
 	parser.add_argument("--epochs", type=int, default=40)
 	parser.add_argument("--batch-size", type=int, default=2048)
 	parser.add_argument("--learning-rate", type=float, default=3e-4)
+	parser.add_argument(
+		"--checkpoint-monitor",
+		default="val_mae_abs_le_3",
+		help="Metric used for best-checkpoint selection and learning-rate reduction.",
+	)
 	parser.add_argument("--validation-fraction", type=float, default=0.05)
 	parser.add_argument(
 		"--split-seed",
@@ -73,6 +79,11 @@ def parse_args():
 		help="Seed string for the deterministic FEN hash train/validation split.",
 	)
 	parser.add_argument("--shuffle-buffer", type=int, default=100000)
+	parser.add_argument(
+		"--disable-mirror-augmentation",
+		action="store_true",
+		help="Disable horizontal mirroring for positions without castling or en-passant rights.",
+	)
 	parser.add_argument(
 		"--max-rows-per-file",
 		type=int,
@@ -212,6 +223,27 @@ def build_mlp_model(learning_rate):
 	return compile_model(model, learning_rate)
 
 
+def group_norm(x, name):
+	return tf.keras.layers.GroupNormalization(
+		groups=16,
+		axis=-1,
+		epsilon=1e-5,
+		name=name,
+	)(x)
+
+
+def squeeze_excitation(x, filters, name):
+	scale = tf.keras.layers.GlobalAveragePooling2D(name=f"{name}_pool")(x)
+	scale = tf.keras.layers.Dense(
+		filters // 8, activation="swish", name=f"{name}_dense_1"
+	)(scale)
+	scale = tf.keras.layers.Dense(
+		filters, activation="sigmoid", name=f"{name}_dense_2"
+	)(scale)
+	scale = tf.keras.layers.Reshape((1, 1, filters), name=f"{name}_reshape")(scale)
+	return tf.keras.layers.Multiply(name=f"{name}_scale")([x, scale])
+
+
 def residual_block(x, filters, name):
 	shortcut = x
 	x = tf.keras.layers.Conv2D(
@@ -222,8 +254,8 @@ def residual_block(x, filters, name):
 		kernel_regularizer=tf.keras.regularizers.l2(1e-5),
 		name=f"{name}_conv_1",
 	)(x)
-	x = tf.keras.layers.BatchNormalization(name=f"{name}_bn_1")(x)
-	x = tf.keras.layers.Activation("relu", name=f"{name}_relu_1")(x)
+	x = group_norm(x, name=f"{name}_norm_1")
+	x = tf.keras.layers.Activation("swish", name=f"{name}_activation_1")(x)
 	x = tf.keras.layers.Conv2D(
 		filters,
 		kernel_size=3,
@@ -232,7 +264,8 @@ def residual_block(x, filters, name):
 		kernel_regularizer=tf.keras.regularizers.l2(1e-5),
 		name=f"{name}_conv_2",
 	)(x)
-	x = tf.keras.layers.BatchNormalization(name=f"{name}_bn_2")(x)
+	x = group_norm(x, name=f"{name}_norm_2")
+	x = squeeze_excitation(x, filters, name=f"{name}_se")
 
 	if shortcut.shape[-1] != filters:
 		shortcut = tf.keras.layers.Conv2D(
@@ -243,20 +276,20 @@ def residual_block(x, filters, name):
 			kernel_regularizer=tf.keras.regularizers.l2(1e-5),
 			name=f"{name}_projection",
 		)(shortcut)
-		shortcut = tf.keras.layers.BatchNormalization(name=f"{name}_projection_bn")(shortcut)
+		shortcut = group_norm(shortcut, name=f"{name}_projection_norm")
 
 	x = tf.keras.layers.Add(name=f"{name}_add")([shortcut, x])
-	return tf.keras.layers.Activation("relu", name=f"{name}_relu_2")(x)
+	return tf.keras.layers.Activation("swish", name=f"{name}_activation_2")(x)
 
 
-def build_cnn_model(learning_rate):
-	inputs = tf.keras.Input(shape=(ATTACK_FEATURE_SIZE,), name="position")
+def build_cnn_model(learning_rate, max_abs_pawns=10.0):
+	inputs = tf.keras.Input(shape=(PERSPECTIVE_FEATURE_SIZE,), name="position")
 	sequence = tf.keras.layers.Reshape(
-		(ATTACK_FEATURE_SIZE, 1), name="feature_sequence"
+		(PERSPECTIVE_FEATURE_SIZE, 1), name="feature_sequence"
 	)(inputs)
 
 	board = tf.keras.layers.Cropping1D(
-		cropping=(0, METADATA_SIZE), name="board_feature_slice"
+		cropping=(0, PERSPECTIVE_METADATA_SIZE), name="board_feature_slice"
 	)(sequence)
 	board = tf.keras.layers.Reshape(
 		(8, 8, PIECE_PLANE_COUNT + ATTACK_PLANE_COUNT), name="board_planes"
@@ -266,47 +299,65 @@ def build_cnn_model(learning_rate):
 		cropping=(ATTACK_BOARD_FEATURE_SIZE, 0), name="metadata_feature_slice"
 	)(sequence)
 	metadata = tf.keras.layers.Flatten(name="metadata_flatten")(metadata)
-	metadata = tf.keras.layers.Dense(64, activation="relu", name="metadata_dense")(metadata)
+	metadata = tf.keras.layers.Dense(
+		32, activation="swish", name="metadata_dense"
+	)(metadata)
 
 	x = tf.keras.layers.Conv2D(
-		64,
+		96,
 		kernel_size=3,
 		padding="same",
 		use_bias=False,
 		kernel_regularizer=tf.keras.regularizers.l2(1e-5),
 		name="stem_conv",
 	)(board)
-	x = tf.keras.layers.BatchNormalization(name="stem_bn")(x)
-	x = tf.keras.layers.Activation("relu", name="stem_relu")(x)
+	x = group_norm(x, name="stem_norm")
+	x = tf.keras.layers.Activation("swish", name="stem_activation")(x)
 
-	x = residual_block(x, 64, "res_64_1")
-	x = residual_block(x, 64, "res_64_2")
-	x = residual_block(x, 128, "res_128_1")
-	x = residual_block(x, 128, "res_128_2")
+	for block_index in range(6):
+		x = residual_block(x, 96, f"res_{block_index + 1}")
 
-	spatial = tf.keras.layers.Flatten(name="spatial_flatten")(x)
+	spatial = tf.keras.layers.Conv2D(
+		32,
+		kernel_size=1,
+		padding="same",
+		use_bias=False,
+		name="value_conv",
+	)(x)
+	spatial = group_norm(spatial, name="value_norm")
+	spatial = tf.keras.layers.Activation("swish", name="value_activation")(spatial)
+	spatial = tf.keras.layers.Flatten(name="value_flatten")(spatial)
 	x = tf.keras.layers.Concatenate(name="spatial_metadata")([spatial, metadata])
 	x = tf.keras.layers.Dense(
-		512,
-		activation="relu",
+		256,
+		activation="swish",
 		kernel_regularizer=tf.keras.regularizers.l2(1e-5),
 		name="value_dense_1",
 	)(x)
-	x = tf.keras.layers.Dropout(0.15, name="value_dropout")(x)
-	x = tf.keras.layers.Dense(128, activation="relu", name="value_dense_2")(x)
-	outputs = tf.keras.layers.Dense(1, name="side_to_move_pawn_score")(x)
+	x = tf.keras.layers.Dropout(0.20, name="value_dropout")(x)
+	x = tf.keras.layers.Dense(64, activation="swish", name="value_dense_2")(x)
+	unit_score = tf.keras.layers.Dense(
+		1,
+		activation="tanh",
+		kernel_initializer="zeros",
+		bias_initializer="zeros",
+		name="bounded_unit_score",
+	)(x)
+	outputs = tf.keras.layers.Rescaling(
+		scale=max_abs_pawns, name="side_to_move_pawn_score"
+	)(unit_score)
 
 	model = tf.keras.Model(
 		inputs=inputs,
 		outputs=outputs,
-		name="position_evaluator_cnn_attacks",
+		name="position_evaluator_cnn_v2",
 	)
 	return compile_model(model, learning_rate)
 
 
-def build_model(architecture, learning_rate):
+def build_model(architecture, learning_rate, max_abs_pawns=10.0):
 	if architecture == "cnn":
-		return build_cnn_model(learning_rate)
+		return build_cnn_model(learning_rate, max_abs_pawns=max_abs_pawns)
 	if architecture == "mlp":
 		return build_mlp_model(learning_rate)
 	raise ValueError(f"unsupported architecture: {architecture}")
@@ -360,12 +411,13 @@ def iter_examples(
 	paths,
 	row_counts,
 	split,
-	include_attack_maps,
+	architecture,
 	max_abs_pawns,
 	validation_fraction,
 	split_seed,
 	focus_loss_pawns,
 	min_sample_weight,
+	mirror_augmentation,
 ):
 	for path, row_count in zip(paths, row_counts):
 		with path.open(newline="") as file:
@@ -384,9 +436,19 @@ def iter_examples(
 				if split == "validation" and not is_validation:
 					continue
 
-				features = encode_fen(
-					row["FEN"], include_attack_maps=include_attack_maps
-				)
+				if architecture == "cnn":
+					fen_fields = row["FEN"].split()
+					can_mirror = (
+						mirror_augmentation
+						and fen_fields[2] == "-"
+						and fen_fields[3] == "-"
+					)
+					features = encode_fen_perspective(
+						row["FEN"],
+						mirror_files=can_mirror and np.random.random() < 0.5,
+					)
+				else:
+					features = encode_fen(row["FEN"])
 				target = evaluation_to_pawns(row["Evaluation"], max_abs_pawns=max_abs_pawns)
 				weight = sample_weight_for_target(
 					target=target,
@@ -396,20 +458,23 @@ def iter_examples(
 				yield features, np.array([target], dtype=np.float32), np.float32(weight)
 
 
-def make_dataset(paths, row_counts, split, args):
-	include_attack_maps = args.architecture == "cnn"
-	feature_size = ATTACK_FEATURE_SIZE if include_attack_maps else FEATURE_SIZE
-	dataset = tf.data.Dataset.from_generator(
+def make_generator_dataset(paths, row_counts, split, args, feature_size):
+	return tf.data.Dataset.from_generator(
 		lambda: iter_examples(
 			paths=paths,
 			row_counts=row_counts,
 			split=split,
-			include_attack_maps=include_attack_maps,
+			architecture=args.architecture,
 			max_abs_pawns=args.max_abs_pawns,
 			validation_fraction=args.validation_fraction,
 			split_seed=args.split_seed,
 			focus_loss_pawns=args.focus_loss_pawns,
 			min_sample_weight=args.min_sample_weight,
+			mirror_augmentation=(
+				split == "train"
+				and args.architecture == "cnn"
+				and not args.disable_mirror_augmentation
+			),
 		),
 		output_signature=(
 			tf.TensorSpec(shape=(feature_size,), dtype=tf.float32),
@@ -417,10 +482,41 @@ def make_dataset(paths, row_counts, split, args):
 			tf.TensorSpec(shape=(), dtype=tf.float32),
 		),
 	)
-	if split == "train" and args.shuffle_buffer > 0:
-		dataset = dataset.shuffle(args.shuffle_buffer, reshuffle_each_iteration=True)
-	if split == "train":
-		dataset = dataset.repeat()
+
+
+def make_dataset(paths, row_counts, split_counts, split, args):
+	feature_size = PERSPECTIVE_FEATURE_SIZE if args.architecture == "cnn" else FEATURE_SIZE
+	if split == "train" and len(paths) > 1:
+		source_datasets = []
+		source_weights = []
+		for path, row_count, split_count in zip(paths, row_counts, split_counts):
+			if split_count == 0:
+				continue
+			source_dataset = make_generator_dataset(
+				[path], [row_count], split, args, feature_size
+			)
+			if args.shuffle_buffer > 0:
+				source_dataset = source_dataset.shuffle(
+					min(args.shuffle_buffer, split_count),
+					reshuffle_each_iteration=True,
+				)
+			source_datasets.append(source_dataset.repeat())
+			source_weights.append(split_count)
+
+		dataset = tf.data.Dataset.sample_from_datasets(
+			source_datasets,
+			weights=np.asarray(source_weights, dtype=np.float64)
+			/ np.sum(source_weights),
+			seed=zlib.crc32(args.split_seed.encode("utf-8")),
+		)
+	else:
+		dataset = make_generator_dataset(paths, row_counts, split, args, feature_size)
+		if split == "train":
+			if args.shuffle_buffer > 0:
+				dataset = dataset.shuffle(
+					args.shuffle_buffer, reshuffle_each_iteration=True
+				)
+			dataset = dataset.repeat()
 	return dataset.batch(args.batch_size).prefetch(tf.data.AUTOTUNE)
 
 
@@ -472,8 +568,14 @@ def main():
 	print(f"Architecture: {args.architecture}")
 	print(
 		f"Input features: "
-		f"{ATTACK_FEATURE_SIZE if args.architecture == 'cnn' else FEATURE_SIZE}"
+		f"{PERSPECTIVE_FEATURE_SIZE if args.architecture == 'cnn' else FEATURE_SIZE}"
 	)
+	if args.architecture == "cnn":
+		print("Representation: side-to-move canonical piece and attack planes")
+		print(
+			"Mirror augmentation: "
+			f"{'disabled' if args.disable_mirror_augmentation else 'enabled'}"
+		)
 	print(f"Model checkpoint: {args.model_out}")
 	print(f"Weights checkpoint: {args.weights_out}")
 	print(f"Split: deterministic FEN hash ({args.validation_fraction:.1%} validation)")
@@ -490,10 +592,14 @@ def main():
 	):
 		print(f"  {path}: {rows} rows ({train_count} train, {validation_count} validation)")
 
-	train_dataset = make_dataset(args.data_files, row_counts, "train", args)
+	train_dataset = make_dataset(
+		args.data_files, row_counts, train_counts, "train", args
+	)
 	validation_dataset = None
 	if validation_rows > 0:
-		validation_dataset = make_dataset(args.data_files, row_counts, "validation", args)
+		validation_dataset = make_dataset(
+			args.data_files, row_counts, validation_counts, "validation", args
+		)
 
 	if args.dry_run:
 		for features, targets, sample_weights in train_dataset.take(1):
@@ -507,7 +613,11 @@ def main():
 			)
 		return
 
-	model = build_model(args.architecture, args.learning_rate)
+	model = build_model(
+		args.architecture,
+		args.learning_rate,
+		max_abs_pawns=args.max_abs_pawns,
+	)
 	args.model_out.parent.mkdir(parents=True, exist_ok=True)
 	if args.weights_out is not None:
 		args.weights_out.parent.mkdir(parents=True, exist_ok=True)
@@ -525,17 +635,30 @@ def main():
 	callbacks = [
 		tf.keras.callbacks.ModelCheckpoint(
 			filepath=str(args.model_out),
-			monitor="val_loss" if validation_dataset is not None else "loss",
+			monitor=args.checkpoint_monitor if validation_dataset is not None else "loss",
 			save_best_only=True,
+			mode="min",
 		),
 	]
+	if validation_dataset is not None:
+		callbacks.append(
+			tf.keras.callbacks.ReduceLROnPlateau(
+				monitor=args.checkpoint_monitor,
+				mode="min",
+				factor=0.3,
+				patience=2,
+				min_lr=1e-6,
+				verbose=1,
+			)
+		)
 	if args.weights_out is not None:
 		callbacks.append(
 			tf.keras.callbacks.ModelCheckpoint(
 				filepath=str(args.weights_out),
-				monitor="val_loss" if validation_dataset is not None else "loss",
+				monitor=args.checkpoint_monitor if validation_dataset is not None else "loss",
 				save_best_only=True,
 				save_weights_only=True,
+				mode="min",
 			)
 		)
 

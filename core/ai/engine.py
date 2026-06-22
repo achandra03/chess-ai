@@ -4,7 +4,13 @@ from pathlib import Path
 import numpy as np
 import tensorflow as tf
 
-from position_encoding import ATTACK_FEATURE_SIZE, FEATURE_SIZE, encode_board
+from position_encoding import (
+	ATTACK_FEATURE_SIZE,
+	FEATURE_SIZE,
+	PERSPECTIVE_FEATURE_SIZE,
+	encode_board,
+	encode_board_perspective,
+)
 
 
 MATE_SCORE = 100000.0
@@ -21,10 +27,16 @@ class Engine:
 
 		if self.model_input_size == 128:
 			self.encoder = tf.saved_model.load(str(Path(__file__).resolve().parent / "encoder_model"))
-		elif self.model_input_size not in (None, FEATURE_SIZE, ATTACK_FEATURE_SIZE):
+		elif self.model_input_size not in (
+			None,
+			FEATURE_SIZE,
+			ATTACK_FEATURE_SIZE,
+			PERSPECTIVE_FEATURE_SIZE,
+		):
 			raise ValueError(
 				f"unsupported evaluator input size {self.model_input_size}; "
-				f"expected {FEATURE_SIZE}, {ATTACK_FEATURE_SIZE}, or legacy 128"
+				f"expected {FEATURE_SIZE}, {ATTACK_FEATURE_SIZE}, "
+				f"{PERSPECTIVE_FEATURE_SIZE}, or legacy 128"
 			)
 
 	def _resolve_model_path(self, model_path):
@@ -36,6 +48,7 @@ class Engine:
 
 		model_dir = Path(__file__).resolve().parent
 		for name in (
+			"position_evaluator_cnn_v2.keras",
 			"position_evaluator_cnn_attacks.keras",
 			"position_evaluator_cnn.keras",
 			"position_evaluator.keras",
@@ -102,6 +115,11 @@ class Engine:
 		return self._run_layers(self.nn, inp, 3)
 
 	def nn_input(self):
+		if self.model_input_size == PERSPECTIVE_FEATURE_SIZE:
+			return encode_board_perspective(self.board).reshape(
+				1, PERSPECTIVE_FEATURE_SIZE
+			)
+
 		include_attack_maps = self.model_input_size == ATTACK_FEATURE_SIZE
 		feature_size = ATTACK_FEATURE_SIZE if include_attack_maps else FEATURE_SIZE
 		features = encode_board(
