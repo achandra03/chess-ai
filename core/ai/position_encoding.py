@@ -20,6 +20,8 @@ METADATA_SIZE = 7
 PIECE_PLANE_COUNT = len(PIECE_PLANES)
 ATTACK_PLANE_COUNT = len(PIECE_PLANES)
 BOARD_FEATURE_SIZE = BOARD_SIZE * BOARD_SIZE * PIECE_PLANE_COUNT
+PAPER_BITMAP_FEATURE_SIZE = BOARD_FEATURE_SIZE
+PAPER_MAX_ABS_CENTIPAWNS = 5000
 ATTACK_BOARD_FEATURE_SIZE = BOARD_SIZE * BOARD_SIZE * (
 	PIECE_PLANE_COUNT + ATTACK_PLANE_COUNT
 )
@@ -51,6 +53,59 @@ def evaluation_to_pawns(evaluation, max_abs_pawns=10.0):
 		score = int(value) / 100.0
 
 	return float(np.clip(score, -max_abs_pawns, max_abs_pawns))
+
+
+def evaluation_to_paper_target(
+	evaluation, max_abs_centipawns=PAPER_MAX_ABS_CENTIPAWNS
+):
+	"""Map a side-to-move Stockfish score to the paper's [0, 1] target range."""
+	value = str(evaluation).strip()
+	if not value:
+		raise ValueError("empty evaluation")
+
+	if value.startswith("#"):
+		if len(value) < 2 or value[1] not in "+-":
+			raise ValueError(f"invalid mate evaluation: {value}")
+		centipawns = max_abs_centipawns if value[1] == "+" else -max_abs_centipawns
+	else:
+		centipawns = int(value)
+
+	centipawns = np.clip(
+		centipawns, -max_abs_centipawns, max_abs_centipawns
+	)
+	return float(
+		(centipawns + max_abs_centipawns) / (2.0 * max_abs_centipawns)
+	)
+
+
+def paper_target_to_pawns(
+	target, max_abs_centipawns=PAPER_MAX_ABS_CENTIPAWNS
+):
+	"""Convert the paper MLP's [0, 1] output back to side-to-move pawns."""
+	centipawns = (
+		float(target) * (2.0 * max_abs_centipawns) - max_abs_centipawns
+	)
+	return centipawns / 100.0
+
+
+def encode_fen_paper_bitmap(fen):
+	"""Encode a FEN as the paper's 768-value, 12-plane bitmap input."""
+	fields = str(fen).strip().split()
+	if len(fields) < 1:
+		raise ValueError(f"invalid FEN: {fen}")
+
+	board_symbols = _symbols_from_fen_board(fields[0])
+	return _paper_bitmap_from_symbols(board_symbols)
+
+
+def encode_board_paper_bitmap(board):
+	"""Encode a live board with the same bitmap schema used for paper training."""
+	board_symbols = [[None for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
+	for row in board.pieces:
+		for piece in row:
+			if piece is not None:
+				board_symbols[piece.y][piece.x] = piece.symbol
+	return _paper_bitmap_from_symbols(board_symbols)
 
 
 def encode_fen(fen, include_attack_maps=False):
@@ -154,6 +209,18 @@ def _symbols_from_fen_board(board_part):
 		board_symbols.append(symbols)
 
 	return board_symbols
+
+
+def _paper_bitmap_from_symbols(board_symbols):
+	planes = np.zeros(
+		(BOARD_SIZE, BOARD_SIZE, PIECE_PLANE_COUNT), dtype=np.float32
+	)
+	for fen_y, row in enumerate(board_symbols):
+		paper_y = BOARD_SIZE - 1 - fen_y
+		for x, symbol in enumerate(row):
+			if symbol is not None:
+				planes[paper_y, x, PIECE_PLANES[symbol]] = 1.0
+	return planes.reshape(PAPER_BITMAP_FEATURE_SIZE)
 
 
 def _encode_symbols(board_symbols, white_to_move, castling_rights, include_attack_maps):

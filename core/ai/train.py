@@ -1,8 +1,8 @@
 import argparse
 import csv
+import hashlib
 import math
 import os
-import zlib
 from pathlib import Path
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
@@ -11,108 +11,80 @@ import numpy as np
 import tensorflow as tf
 
 from position_encoding import (
-	ATTACK_PLANE_COUNT,
-	ATTACK_BOARD_FEATURE_SIZE,
-	FEATURE_SIZE,
-	PERSPECTIVE_FEATURE_SIZE,
-	PERSPECTIVE_METADATA_SIZE,
-	PIECE_PLANE_COUNT,
-	encode_fen,
-	encode_fen_perspective,
-	evaluation_to_pawns,
+	PAPER_BITMAP_FEATURE_SIZE,
+	PAPER_MAX_ABS_CENTIPAWNS,
+	encode_fen_paper_bitmap,
+	evaluation_to_paper_target,
 )
 
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 AI_DIR = Path(__file__).resolve().parent
-DATA_DIR = ROOT_DIR / "data"
-DEFAULT_DATA_FILES = [
-	DATA_DIR / "chessData.csv",
-	DATA_DIR / "random_evals.csv",
-	DATA_DIR / "tactic_evals.csv",
-]
-DEFAULT_CNN_MODEL_OUT = AI_DIR / "position_evaluator_cnn_v2.keras"
-DEFAULT_CNN_WEIGHTS_OUT = AI_DIR / "position_evaluator_cnn_v2.weights.h5"
-DEFAULT_MLP_MODEL_OUT = AI_DIR / "position_evaluator.keras"
-DEFAULT_MLP_WEIGHTS_OUT = AI_DIR / "position_evaluator.weights.h5"
+DEFAULT_DATA_FILE = ROOT_DIR / "data" / "chessData_depth8.csv"
+DEFAULT_MODEL_OUT = AI_DIR / "position_evaluator_paper_mlp.keras"
+DEFAULT_WEIGHTS_OUT = AI_DIR / "position_evaluator_paper_mlp.weights.h5"
 
 
 def parse_args():
-	parser = argparse.ArgumentParser(description="Train the chess position evaluator.")
+	parser = argparse.ArgumentParser(
+		description="Train the Sabatelli-style depth-8 bitmap MLP evaluator."
+	)
+	parser.add_argument("--data-file", type=Path, default=DEFAULT_DATA_FILE)
+	parser.add_argument("--model-out", type=Path, default=DEFAULT_MODEL_OUT)
+	parser.add_argument("--weights-out", type=Path, default=DEFAULT_WEIGHTS_OUT)
 	parser.add_argument(
-		"--data-files",
-		nargs="+",
-		type=Path,
-		default=DEFAULT_DATA_FILES,
-		help="CSV files with FEN and Evaluation columns.",
+		"--epochs",
+		type=int,
+		default=600,
+		help=(
+			"The paper does not report an exact epoch count. 600 approximates "
+			"its reported three-day convergence time at 440 seconds per epoch."
+		),
+	)
+	parser.add_argument("--batch-size", type=int, default=248)
+	parser.add_argument("--learning-rate", type=float, default=0.001)
+	parser.add_argument("--momentum", type=float, default=0.7)
+	parser.add_argument(
+		"--sample-size",
+		type=int,
+		default=3_000_000,
+		help=(
+			"Approximate number of positions selected deterministically from "
+			"the source CSV. Set to 0 to use every row."
+		),
 	)
 	parser.add_argument(
-		"--model-out",
-		type=Path,
-		default=None,
-		help="Path for the trained Keras evaluator.",
+		"--sample-seed",
+		default="sabatelli-dataset4-sample-v1",
+		help="Seed for deterministic position sampling.",
 	)
-	parser.add_argument(
-		"--weights-out",
-		type=Path,
-		default=None,
-		help="Optional path for best weights-only checkpoint.",
-	)
-	parser.add_argument(
-		"--architecture",
-		choices=("cnn", "mlp"),
-		default="cnn",
-		help="Evaluator architecture to train.",
-	)
-	parser.add_argument("--epochs", type=int, default=40)
-	parser.add_argument("--batch-size", type=int, default=2048)
-	parser.add_argument("--learning-rate", type=float, default=3e-4)
-	parser.add_argument(
-		"--checkpoint-monitor",
-		default="val_mae_abs_le_3",
-		help="Metric used for best-checkpoint selection and learning-rate reduction.",
-	)
-	parser.add_argument("--validation-fraction", type=float, default=0.05)
 	parser.add_argument(
 		"--split-seed",
-		default="chess-ai-position-evaluator-v1",
-		help="Seed string for the deterministic FEN hash train/validation split.",
-	)
-	parser.add_argument("--shuffle-buffer", type=int, default=100000)
-	parser.add_argument(
-		"--disable-mirror-augmentation",
-		action="store_true",
-		help="Disable horizontal mirroring for positions without castling or en-passant rights.",
+		default="sabatelli-dataset4-split-v1",
+		help="Seed for the deterministic 80/10/10 position split.",
 	)
 	parser.add_argument(
-		"--max-rows-per-file",
+		"--max-abs-centipawns",
+		type=int,
+		default=PAPER_MAX_ABS_CENTIPAWNS,
+		help=(
+			"Clip evaluations to this range before mapping them to [0, 1]. "
+			"The thesis omits the clipping formula; 5000 matches the original "
+			"project preprocessing."
+		),
+	)
+	parser.add_argument("--shuffle-buffer", type=int, default=100_000)
+	parser.add_argument(
+		"--max-rows",
 		type=int,
 		default=None,
-		help="Optional cap per CSV, useful for smoke tests.",
-	)
-	parser.add_argument(
-		"--max-abs-pawns",
-		type=float,
-		default=10.0,
-		help="Clip training targets to this absolute pawn score.",
-	)
-	parser.add_argument(
-		"--focus-loss-pawns",
-		type=float,
-		default=3.0,
-		help="Give positions within this absolute pawn score full loss weight. Set to 0 to disable weighting.",
-	)
-	parser.add_argument(
-		"--min-sample-weight",
-		type=float,
-		default=0.25,
-		help="Minimum loss weight for extreme positions when --focus-loss-pawns is enabled.",
+		help="Optional source-row cap for smoke tests.",
 	)
 	parser.add_argument(
 		"--steps-per-epoch",
 		type=int,
 		default=None,
-		help="Optional cap on train steps per epoch.",
+		help="Optional cap on training steps per epoch.",
 	)
 	parser.add_argument(
 		"--validation-steps",
@@ -121,9 +93,15 @@ def parse_args():
 		help="Optional cap on validation steps.",
 	)
 	parser.add_argument(
+		"--test-steps",
+		type=int,
+		default=None,
+		help="Optional cap on final test steps.",
+	)
+	parser.add_argument(
 		"--dry-run",
 		action="store_true",
-		help="Build one batch and print its shape without training.",
+		help="Inspect one batch and the model without training.",
 	)
 	return parser.parse_args()
 
@@ -136,531 +114,295 @@ def configure_tensorflow():
 			pass
 
 
-def resolve_output_paths(args):
-	if args.model_out is None:
-		if args.architecture == "cnn":
-			args.model_out = DEFAULT_CNN_MODEL_OUT
-		else:
-			args.model_out = DEFAULT_MLP_MODEL_OUT
-
-	if args.weights_out is None:
-		if args.architecture == "cnn":
-			args.weights_out = DEFAULT_CNN_WEIGHTS_OUT
-		else:
-			args.weights_out = DEFAULT_MLP_WEIGHTS_OUT
-
-
-@tf.keras.utils.register_keras_serializable(package="ChessAI")
-class TargetRangeMAE(tf.keras.metrics.Metric):
-	def __init__(self, min_abs=None, max_abs=None, name="target_range_mae", **kwargs):
-		super().__init__(name=name, **kwargs)
-		self.min_abs = min_abs
-		self.max_abs = max_abs
-		self.total_error = self.add_weight(name="total_error", initializer="zeros")
-		self.count = self.add_weight(name="count", initializer="zeros")
-
-	def update_state(self, y_true, y_pred, sample_weight=None):
-		y_true = tf.cast(y_true, self.dtype)
-		y_pred = tf.cast(y_pred, self.dtype)
-		target_abs = tf.abs(y_true)
-		mask = tf.ones_like(target_abs, dtype=tf.bool)
-		if self.min_abs is not None:
-			mask = tf.logical_and(mask, target_abs > self.min_abs)
-		if self.max_abs is not None:
-			mask = tf.logical_and(mask, target_abs <= self.max_abs)
-
-		mask = tf.cast(mask, self.dtype)
-		error = tf.abs(y_true - y_pred) * mask
-		self.total_error.assign_add(tf.reduce_sum(error))
-		self.count.assign_add(tf.reduce_sum(mask))
-
-	def result(self):
-		return tf.math.divide_no_nan(self.total_error, self.count)
-
-	def reset_state(self):
-		self.total_error.assign(0.0)
-		self.count.assign(0.0)
-
-	def get_config(self):
-		config = super().get_config()
-		config.update({"min_abs": self.min_abs, "max_abs": self.max_abs})
-		return config
+def validate_args(args):
+	if not args.data_file.is_file():
+		raise FileNotFoundError(args.data_file)
+	if args.epochs < 1:
+		raise ValueError("--epochs must be positive")
+	if args.batch_size < 1:
+		raise ValueError("--batch-size must be positive")
+	if args.learning_rate <= 0:
+		raise ValueError("--learning-rate must be positive")
+	if args.momentum < 0 or args.momentum >= 1:
+		raise ValueError("--momentum must be in [0, 1)")
+	if args.sample_size < 0:
+		raise ValueError("--sample-size cannot be negative")
+	if args.max_abs_centipawns < 1:
+		raise ValueError("--max-abs-centipawns must be positive")
+	if args.shuffle_buffer < 0:
+		raise ValueError("--shuffle-buffer cannot be negative")
+	if args.max_rows is not None and args.max_rows < 1:
+		raise ValueError("--max-rows must be positive")
+	for name in ("steps_per_epoch", "validation_steps", "test_steps"):
+		value = getattr(args, name)
+		if value is not None and value < 1:
+			raise ValueError(f"--{name.replace('_', '-')} must be positive")
+	if not str(args.weights_out).endswith(".weights.h5"):
+		raise ValueError("--weights-out must end with .weights.h5")
 
 
-def compile_model(model, learning_rate):
+def build_model(learning_rate=0.001, momentum=0.7):
+	inputs = tf.keras.Input(
+		shape=(PAPER_BITMAP_FEATURE_SIZE,), name="bitmap_position"
+	)
+	x = tf.keras.layers.Dense(2048, activation="elu", name="hidden_1")(inputs)
+	x = tf.keras.layers.BatchNormalization(name="batch_norm_1")(x)
+	x = tf.keras.layers.Dense(2048, activation="elu", name="hidden_2")(x)
+	x = tf.keras.layers.BatchNormalization(name="batch_norm_2")(x)
+	x = tf.keras.layers.Dense(2048, activation="elu", name="hidden_3")(x)
+	outputs = tf.keras.layers.Dense(
+		1, activation="sigmoid", name="normalized_evaluation"
+	)(x)
+
+	model = tf.keras.Model(
+		inputs=inputs,
+		outputs=outputs,
+		name="sabatelli_bitmap_mlp",
+	)
 	model.compile(
-		optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=1.0),
-		loss=tf.keras.losses.Huber(delta=1.0),
+		optimizer=tf.keras.optimizers.SGD(
+			learning_rate=learning_rate,
+			momentum=momentum,
+			nesterov=True,
+		),
+		loss=tf.keras.losses.MeanSquaredError(),
 		metrics=[
+			tf.keras.metrics.MeanSquaredError(name="mse"),
+			tf.keras.metrics.RootMeanSquaredError(name="rmse"),
 			tf.keras.metrics.MeanAbsoluteError(name="mae"),
-			TargetRangeMAE(max_abs=1.0, name="mae_abs_le_1"),
-			TargetRangeMAE(max_abs=3.0, name="mae_abs_le_3"),
-			TargetRangeMAE(max_abs=5.0, name="mae_abs_le_5"),
-			TargetRangeMAE(min_abs=5.0, name="mae_abs_gt_5"),
 		],
 	)
 	return model
 
 
-def build_mlp_model(learning_rate):
-	inputs = tf.keras.Input(shape=(FEATURE_SIZE,), name="position")
-	x = tf.keras.layers.Dense(
-		1024,
-		activation="relu",
-		kernel_regularizer=tf.keras.regularizers.l2(1e-5),
-	)(inputs)
-	x = tf.keras.layers.Dropout(0.10)(x)
-	x = tf.keras.layers.Dense(
-		512,
-		activation="relu",
-		kernel_regularizer=tf.keras.regularizers.l2(1e-5),
-	)(x)
-	x = tf.keras.layers.Dropout(0.10)(x)
-	x = tf.keras.layers.Dense(256, activation="relu")(x)
-	outputs = tf.keras.layers.Dense(1, name="side_to_move_pawn_score")(x)
-
-	model = tf.keras.Model(inputs=inputs, outputs=outputs, name="position_evaluator")
-	return compile_model(model, learning_rate)
+def position_key(fen):
+	fields = str(fen).strip().split()
+	if len(fields) < 4:
+		raise ValueError(f"invalid FEN: {fen}")
+	return " ".join(fields[:4])
 
 
-def group_norm(x, name):
-	return tf.keras.layers.GroupNormalization(
-		groups=16,
-		axis=-1,
-		epsilon=1e-5,
-		name=name,
-	)(x)
+def hash_fraction(seed, value):
+	digest = hashlib.blake2b(
+		f"{seed}\0{value}".encode("utf-8"), digest_size=8
+	).digest()
+	return int.from_bytes(digest, "big") / 2**64
 
 
-def squeeze_excitation(x, filters, name):
-	scale = tf.keras.layers.GlobalAveragePooling2D(name=f"{name}_pool")(x)
-	scale = tf.keras.layers.Dense(
-		filters // 8, activation="swish", name=f"{name}_dense_1"
-	)(scale)
-	scale = tf.keras.layers.Dense(
-		filters, activation="sigmoid", name=f"{name}_dense_2"
-	)(scale)
-	scale = tf.keras.layers.Reshape((1, 1, filters), name=f"{name}_reshape")(scale)
-	return tf.keras.layers.Multiply(name=f"{name}_scale")([x, scale])
+def split_for_fen(fen, split_seed):
+	value = hash_fraction(split_seed, position_key(fen))
+	if value < 0.8:
+		return "train"
+	if value < 0.9:
+		return "validation"
+	return "test"
 
 
-def residual_block(x, filters, name):
-	shortcut = x
-	x = tf.keras.layers.Conv2D(
-		filters,
-		kernel_size=3,
-		padding="same",
-		use_bias=False,
-		kernel_regularizer=tf.keras.regularizers.l2(1e-5),
-		name=f"{name}_conv_1",
-	)(x)
-	x = group_norm(x, name=f"{name}_norm_1")
-	x = tf.keras.layers.Activation("swish", name=f"{name}_activation_1")(x)
-	x = tf.keras.layers.Conv2D(
-		filters,
-		kernel_size=3,
-		padding="same",
-		use_bias=False,
-		kernel_regularizer=tf.keras.regularizers.l2(1e-5),
-		name=f"{name}_conv_2",
-	)(x)
-	x = group_norm(x, name=f"{name}_norm_2")
-	x = squeeze_excitation(x, filters, name=f"{name}_se")
-
-	if shortcut.shape[-1] != filters:
-		shortcut = tf.keras.layers.Conv2D(
-			filters,
-			kernel_size=1,
-			padding="same",
-			use_bias=False,
-			kernel_regularizer=tf.keras.regularizers.l2(1e-5),
-			name=f"{name}_projection",
-		)(shortcut)
-		shortcut = group_norm(shortcut, name=f"{name}_projection_norm")
-
-	x = tf.keras.layers.Add(name=f"{name}_add")([shortcut, x])
-	return tf.keras.layers.Activation("swish", name=f"{name}_activation_2")(x)
+def selected_for_sample(fen, sample_fraction, sample_seed):
+	if sample_fraction >= 1.0:
+		return True
+	return hash_fraction(sample_seed, position_key(fen)) < sample_fraction
 
 
-def build_cnn_model(learning_rate, max_abs_pawns=10.0):
-	inputs = tf.keras.Input(shape=(PERSPECTIVE_FEATURE_SIZE,), name="position")
-	sequence = tf.keras.layers.Reshape(
-		(PERSPECTIVE_FEATURE_SIZE, 1), name="feature_sequence"
-	)(inputs)
-
-	board = tf.keras.layers.Cropping1D(
-		cropping=(0, PERSPECTIVE_METADATA_SIZE), name="board_feature_slice"
-	)(sequence)
-	board = tf.keras.layers.Reshape(
-		(8, 8, PIECE_PLANE_COUNT + ATTACK_PLANE_COUNT), name="board_planes"
-	)(board)
-
-	metadata = tf.keras.layers.Cropping1D(
-		cropping=(ATTACK_BOARD_FEATURE_SIZE, 0), name="metadata_feature_slice"
-	)(sequence)
-	metadata = tf.keras.layers.Flatten(name="metadata_flatten")(metadata)
-	metadata = tf.keras.layers.Dense(
-		32, activation="swish", name="metadata_dense"
-	)(metadata)
-
-	x = tf.keras.layers.Conv2D(
-		96,
-		kernel_size=3,
-		padding="same",
-		use_bias=False,
-		kernel_regularizer=tf.keras.regularizers.l2(1e-5),
-		name="stem_conv",
-	)(board)
-	x = group_norm(x, name="stem_norm")
-	x = tf.keras.layers.Activation("swish", name="stem_activation")(x)
-
-	for block_index in range(6):
-		x = residual_block(x, 96, f"res_{block_index + 1}")
-
-	spatial = tf.keras.layers.Conv2D(
-		32,
-		kernel_size=1,
-		padding="same",
-		use_bias=False,
-		name="value_conv",
-	)(x)
-	spatial = group_norm(spatial, name="value_norm")
-	spatial = tf.keras.layers.Activation("swish", name="value_activation")(spatial)
-	spatial = tf.keras.layers.Flatten(name="value_flatten")(spatial)
-	x = tf.keras.layers.Concatenate(name="spatial_metadata")([spatial, metadata])
-	x = tf.keras.layers.Dense(
-		256,
-		activation="swish",
-		kernel_regularizer=tf.keras.regularizers.l2(1e-5),
-		name="value_dense_1",
-	)(x)
-	x = tf.keras.layers.Dropout(0.20, name="value_dropout")(x)
-	x = tf.keras.layers.Dense(64, activation="swish", name="value_dense_2")(x)
-	unit_score = tf.keras.layers.Dense(
-		1,
-		activation="tanh",
-		kernel_initializer="zeros",
-		bias_initializer="zeros",
-		name="bounded_unit_score",
-	)(x)
-	outputs = tf.keras.layers.Rescaling(
-		scale=max_abs_pawns, name="side_to_move_pawn_score"
-	)(unit_score)
-
-	model = tf.keras.Model(
-		inputs=inputs,
-		outputs=outputs,
-		name="position_evaluator_cnn_v2",
-	)
-	return compile_model(model, learning_rate)
+def count_source_rows(path, max_rows):
+	count = 0
+	with path.open(newline="") as file:
+		reader = csv.DictReader(file)
+		validate_csv_header(reader.fieldnames)
+		for _ in reader:
+			if max_rows is not None and count >= max_rows:
+				break
+			count += 1
+	return count
 
 
-def build_model(architecture, learning_rate, max_abs_pawns=10.0):
-	if architecture == "cnn":
-		return build_cnn_model(learning_rate, max_abs_pawns=max_abs_pawns)
-	if architecture == "mlp":
-		return build_mlp_model(learning_rate)
-	raise ValueError(f"unsupported architecture: {architecture}")
-
-
-def is_validation_fen(fen, validation_fraction, split_seed):
-	if validation_fraction <= 0:
-		return False
-	key = f"{split_seed}\0{fen}".encode("utf-8")
-	return zlib.crc32(key) / 2**32 < validation_fraction
-
-
-def count_split_rows(paths, max_rows, validation_fraction, split_seed):
-	row_counts = []
-	train_counts = []
-	validation_counts = []
-
-	for path in paths:
-		row_count = 0
-		train_count = 0
-		validation_count = 0
-
-		with path.open(newline="") as file:
-			reader = csv.DictReader(file)
-			for row in reader:
-				if max_rows is not None and row_count >= max_rows:
-					break
-				row_count += 1
-				if is_validation_fen(row["FEN"], validation_fraction, split_seed):
-					validation_count += 1
-				else:
-					train_count += 1
-
-		row_counts.append(row_count)
-		train_counts.append(train_count)
-		validation_counts.append(validation_count)
-
-	return row_counts, train_counts, validation_counts
-
-
-def sample_weight_for_target(target, focus_loss_pawns, min_sample_weight):
-	if focus_loss_pawns <= 0:
+def sample_fraction_for(raw_rows, sample_size):
+	if sample_size == 0 or sample_size >= raw_rows:
 		return 1.0
-	target_abs = abs(float(target))
-	if target_abs <= focus_loss_pawns:
-		return 1.0
-	return max(min_sample_weight, focus_loss_pawns / target_abs)
+	return sample_size / raw_rows
+
+
+def count_split_rows(path, raw_rows, sample_fraction, sample_seed, split_seed):
+	counts = {"train": 0, "validation": 0, "test": 0}
+	with path.open(newline="") as file:
+		reader = csv.DictReader(file)
+		validate_csv_header(reader.fieldnames)
+		for row_index, row in enumerate(reader):
+			if row_index >= raw_rows:
+				break
+			fen = row["FEN"]
+			if not selected_for_sample(fen, sample_fraction, sample_seed):
+				continue
+			counts[split_for_fen(fen, split_seed)] += 1
+	return counts
+
+
+def validate_csv_header(fieldnames):
+	if fieldnames is None:
+		raise ValueError("input CSV has no header")
+	if "FEN" not in fieldnames or "Evaluation" not in fieldnames:
+		raise ValueError("input CSV must contain FEN and Evaluation columns")
 
 
 def iter_examples(
-	paths,
-	row_counts,
+	path,
+	raw_rows,
 	split,
-	architecture,
-	max_abs_pawns,
-	validation_fraction,
+	sample_fraction,
+	sample_seed,
 	split_seed,
-	focus_loss_pawns,
-	min_sample_weight,
-	mirror_augmentation,
+	max_abs_centipawns,
 ):
-	for path, row_count in zip(paths, row_counts):
-		with path.open(newline="") as file:
-			reader = csv.DictReader(file)
-			for row_index, row in enumerate(reader):
-				if row_index >= row_count:
-					break
+	with path.open(newline="") as file:
+		reader = csv.DictReader(file)
+		for row_index, row in enumerate(reader):
+			if row_index >= raw_rows:
+				break
 
-				is_validation = is_validation_fen(
-					row["FEN"],
-					validation_fraction=validation_fraction,
-					split_seed=split_seed,
-				)
-				if split == "train" and is_validation:
-					continue
-				if split == "validation" and not is_validation:
-					continue
+			fen = row["FEN"]
+			if not selected_for_sample(fen, sample_fraction, sample_seed):
+				continue
+			if split_for_fen(fen, split_seed) != split:
+				continue
 
-				if architecture == "cnn":
-					fen_fields = row["FEN"].split()
-					can_mirror = (
-						mirror_augmentation
-						and fen_fields[2] == "-"
-						and fen_fields[3] == "-"
-					)
-					features = encode_fen_perspective(
-						row["FEN"],
-						mirror_files=can_mirror and np.random.random() < 0.5,
-					)
-				else:
-					features = encode_fen(row["FEN"])
-				target = evaluation_to_pawns(row["Evaluation"], max_abs_pawns=max_abs_pawns)
-				weight = sample_weight_for_target(
-					target=target,
-					focus_loss_pawns=focus_loss_pawns,
-					min_sample_weight=min_sample_weight,
-				)
-				yield features, np.array([target], dtype=np.float32), np.float32(weight)
+			features = encode_fen_paper_bitmap(fen)
+			target = evaluation_to_paper_target(
+				row["Evaluation"],
+				max_abs_centipawns=max_abs_centipawns,
+			)
+			yield features, np.array([target], dtype=np.float32)
 
 
-def make_generator_dataset(paths, row_counts, split, args, feature_size):
-	return tf.data.Dataset.from_generator(
+def make_dataset(args, raw_rows, split, sample_fraction, repeat=False):
+	dataset = tf.data.Dataset.from_generator(
 		lambda: iter_examples(
-			paths=paths,
-			row_counts=row_counts,
+			path=args.data_file,
+			raw_rows=raw_rows,
 			split=split,
-			architecture=args.architecture,
-			max_abs_pawns=args.max_abs_pawns,
-			validation_fraction=args.validation_fraction,
+			sample_fraction=sample_fraction,
+			sample_seed=args.sample_seed,
 			split_seed=args.split_seed,
-			focus_loss_pawns=args.focus_loss_pawns,
-			min_sample_weight=args.min_sample_weight,
-			mirror_augmentation=(
-				split == "train"
-				and args.architecture == "cnn"
-				and not args.disable_mirror_augmentation
-			),
+			max_abs_centipawns=args.max_abs_centipawns,
 		),
 		output_signature=(
-			tf.TensorSpec(shape=(feature_size,), dtype=tf.float32),
+			tf.TensorSpec(
+				shape=(PAPER_BITMAP_FEATURE_SIZE,), dtype=tf.float32
+			),
 			tf.TensorSpec(shape=(1,), dtype=tf.float32),
-			tf.TensorSpec(shape=(), dtype=tf.float32),
 		),
 	)
-
-
-def make_dataset(paths, row_counts, split_counts, split, args):
-	feature_size = PERSPECTIVE_FEATURE_SIZE if args.architecture == "cnn" else FEATURE_SIZE
-	if split == "train" and len(paths) > 1:
-		source_datasets = []
-		source_weights = []
-		for path, row_count, split_count in zip(paths, row_counts, split_counts):
-			if split_count == 0:
-				continue
-			source_dataset = make_generator_dataset(
-				[path], [row_count], split, args, feature_size
-			)
-			if args.shuffle_buffer > 0:
-				source_dataset = source_dataset.shuffle(
-					min(args.shuffle_buffer, split_count),
-					reshuffle_each_iteration=True,
-				)
-			source_datasets.append(source_dataset.repeat())
-			source_weights.append(split_count)
-
-		dataset = tf.data.Dataset.sample_from_datasets(
-			source_datasets,
-			weights=np.asarray(source_weights, dtype=np.float64)
-			/ np.sum(source_weights),
-			seed=zlib.crc32(args.split_seed.encode("utf-8")),
+	if split == "train" and args.shuffle_buffer > 0:
+		dataset = dataset.shuffle(
+			args.shuffle_buffer,
+			seed=int(hash_fraction(args.split_seed, "shuffle") * (2**31 - 1)),
+			reshuffle_each_iteration=True,
 		)
-	else:
-		dataset = make_generator_dataset(paths, row_counts, split, args, feature_size)
-		if split == "train":
-			if args.shuffle_buffer > 0:
-				dataset = dataset.shuffle(
-					args.shuffle_buffer, reshuffle_each_iteration=True
-				)
-			dataset = dataset.repeat()
+	if repeat:
+		dataset = dataset.repeat()
 	return dataset.batch(args.batch_size).prefetch(tf.data.AUTOTUNE)
 
 
-def validate_args(args):
-	if args.epochs < 1:
-		raise ValueError("--epochs must be positive")
-	if args.batch_size < 1:
-		raise ValueError("--batch-size must be positive")
-	if args.validation_fraction < 0 or args.validation_fraction >= 1:
-		raise ValueError("--validation-fraction must be in [0, 1)")
-	if args.max_abs_pawns <= 0:
-		raise ValueError("--max-abs-pawns must be positive")
-	if args.focus_loss_pawns < 0:
-		raise ValueError("--focus-loss-pawns cannot be negative")
-	if args.min_sample_weight <= 0 or args.min_sample_weight > 1:
-		raise ValueError("--min-sample-weight must be in (0, 1]")
-	if args.max_rows_per_file is not None and args.max_rows_per_file < 1:
-		raise ValueError("--max-rows-per-file must be positive")
-	if args.steps_per_epoch is not None and args.steps_per_epoch < 1:
-		raise ValueError("--steps-per-epoch must be positive")
-	if args.validation_steps is not None and args.validation_steps < 1:
-		raise ValueError("--validation-steps must be positive")
-	if args.weights_out is not None and not str(args.weights_out).endswith(".weights.h5"):
-		raise ValueError("--weights-out must end with .weights.h5")
-
-	for path in args.data_files:
-		if not path.exists():
-			raise FileNotFoundError(path)
+def capped_steps(row_count, batch_size, requested_steps):
+	steps = math.ceil(row_count / batch_size)
+	if requested_steps is not None:
+		steps = min(steps, requested_steps)
+	return steps
 
 
 def main():
 	args = parse_args()
-	resolve_output_paths(args)
 	validate_args(args)
 	configure_tensorflow()
 
-	row_counts, train_counts, validation_counts = count_split_rows(
-		paths=args.data_files,
-		max_rows=args.max_rows_per_file,
-		validation_fraction=args.validation_fraction,
+	raw_rows = count_source_rows(args.data_file, args.max_rows)
+	if raw_rows == 0:
+		raise ValueError("input CSV contains no data rows")
+
+	sample_fraction = sample_fraction_for(raw_rows, args.sample_size)
+	split_counts = count_split_rows(
+		path=args.data_file,
+		raw_rows=raw_rows,
+		sample_fraction=sample_fraction,
+		sample_seed=args.sample_seed,
 		split_seed=args.split_seed,
 	)
-	train_rows = sum(train_counts)
-	validation_rows = sum(validation_counts)
+	if split_counts["train"] == 0:
+		raise ValueError("deterministic sample contains no training rows")
 
-	if train_rows == 0:
-		raise ValueError("no training rows available")
-
-	print(f"Architecture: {args.architecture}")
+	print("Experiment: Sabatelli Dataset 4 bitmap MLP")
+	print(f"Data file: {args.data_file}")
+	print(f"Source rows considered: {raw_rows}")
 	print(
-		f"Input features: "
-		f"{PERSPECTIVE_FEATURE_SIZE if args.architecture == 'cnn' else FEATURE_SIZE}"
+		f"Deterministic sample: {sum(split_counts.values())} positions "
+		f"({sample_fraction:.4%} of considered rows)"
 	)
-	if args.architecture == "cnn":
-		print("Representation: side-to-move canonical piece and attack planes")
-		print(
-			"Mirror augmentation: "
-			f"{'disabled' if args.disable_mirror_augmentation else 'enabled'}"
-		)
+	print(
+		"Split: "
+		f"{split_counts['train']} train, "
+		f"{split_counts['validation']} validation, "
+		f"{split_counts['test']} test"
+	)
+	print(f"Input: {PAPER_BITMAP_FEATURE_SIZE} binary bitmap values")
+	print(
+		"Target: [-"
+		f"{args.max_abs_centipawns}, +{args.max_abs_centipawns}] cp -> [0, 1]"
+	)
+	print(
+		f"Optimizer: SGD(lr={args.learning_rate:g}, momentum={args.momentum:g}, "
+		"nesterov=True)"
+	)
+	print(f"Batch size: {args.batch_size}")
 	print(f"Model checkpoint: {args.model_out}")
 	print(f"Weights checkpoint: {args.weights_out}")
-	print(f"Split: deterministic FEN hash ({args.validation_fraction:.1%} validation)")
-	if args.focus_loss_pawns > 0:
-		print(
-			f"Loss weighting: full weight for |eval| <= {args.focus_loss_pawns:g} pawns, "
-			f"minimum weight {args.min_sample_weight:g}"
-		)
-	else:
-		print("Loss weighting: disabled")
-	print("Training files:")
-	for path, rows, train_count, validation_count in zip(
-		args.data_files, row_counts, train_counts, validation_counts
-	):
-		print(f"  {path}: {rows} rows ({train_count} train, {validation_count} validation)")
 
 	train_dataset = make_dataset(
-		args.data_files, row_counts, train_counts, "train", args
+		args, raw_rows, "train", sample_fraction, repeat=True
 	)
-	validation_dataset = None
-	if validation_rows > 0:
-		validation_dataset = make_dataset(
-			args.data_files, row_counts, validation_counts, "validation", args
-		)
+	validation_dataset = make_dataset(
+		args, raw_rows, "validation", sample_fraction
+	)
+	test_dataset = make_dataset(args, raw_rows, "test", sample_fraction)
 
+	model = build_model(args.learning_rate, args.momentum)
 	if args.dry_run:
-		for features, targets, sample_weights in train_dataset.take(1):
+		for features, targets in train_dataset.take(1):
 			print(f"features: {features.shape} {features.dtype}")
 			print(f"targets: {targets.shape} {targets.dtype}")
-			print(f"sample_weights: {sample_weights.shape} {sample_weights.dtype}")
-			print(f"target range: {targets.numpy().min():.3f} to {targets.numpy().max():.3f}")
 			print(
-				f"sample weight range: {sample_weights.numpy().min():.3f} "
-				f"to {sample_weights.numpy().max():.3f}"
+				f"target range: {targets.numpy().min():.5f} "
+				f"to {targets.numpy().max():.5f}"
 			)
+		print(f"Model parameters: {model.count_params()}")
 		return
 
-	model = build_model(
-		args.architecture,
-		args.learning_rate,
-		max_abs_pawns=args.max_abs_pawns,
-	)
 	args.model_out.parent.mkdir(parents=True, exist_ok=True)
-	if args.weights_out is not None:
-		args.weights_out.parent.mkdir(parents=True, exist_ok=True)
+	args.weights_out.parent.mkdir(parents=True, exist_ok=True)
 
-	steps_per_epoch = math.ceil(train_rows / args.batch_size)
-	if args.steps_per_epoch is not None:
-		steps_per_epoch = min(steps_per_epoch, args.steps_per_epoch)
-
-	validation_steps = None
-	if validation_rows > 0:
-		validation_steps = math.ceil(validation_rows / args.batch_size)
-		if args.validation_steps is not None:
-			validation_steps = min(validation_steps, args.validation_steps)
+	steps_per_epoch = capped_steps(
+		split_counts["train"], args.batch_size, args.steps_per_epoch
+	)
+	validation_steps = capped_steps(
+		split_counts["validation"], args.batch_size, args.validation_steps
+	)
+	test_steps = capped_steps(
+		split_counts["test"], args.batch_size, args.test_steps
+	)
 
 	callbacks = [
 		tf.keras.callbacks.ModelCheckpoint(
 			filepath=str(args.model_out),
-			monitor=args.checkpoint_monitor if validation_dataset is not None else "loss",
-			save_best_only=True,
+			monitor="val_loss",
 			mode="min",
+			save_best_only=True,
+		),
+		tf.keras.callbacks.ModelCheckpoint(
+			filepath=str(args.weights_out),
+			monitor="val_loss",
+			mode="min",
+			save_best_only=True,
+			save_weights_only=True,
 		),
 	]
-	if validation_dataset is not None:
-		callbacks.append(
-			tf.keras.callbacks.ReduceLROnPlateau(
-				monitor=args.checkpoint_monitor,
-				mode="min",
-				factor=0.3,
-				patience=2,
-				min_lr=1e-6,
-				verbose=1,
-			)
-		)
-	if args.weights_out is not None:
-		callbacks.append(
-			tf.keras.callbacks.ModelCheckpoint(
-				filepath=str(args.weights_out),
-				monitor=args.checkpoint_monitor if validation_dataset is not None else "loss",
-				save_best_only=True,
-				save_weights_only=True,
-				mode="min",
-			)
-		)
 
 	model.fit(
 		train_dataset,
@@ -670,9 +412,19 @@ def main():
 		validation_steps=validation_steps,
 		callbacks=callbacks,
 	)
-	print(f"Saved best evaluator checkpoint to {args.model_out}")
-	if args.weights_out is not None:
-		print(f"Saved best weights checkpoint to {args.weights_out}")
+
+	model.load_weights(args.weights_out)
+	results = model.evaluate(
+		test_dataset,
+		steps=test_steps,
+		return_dict=True,
+	)
+	print(f"Saved best evaluator to {args.model_out}")
+	print(f"Saved best weights to {args.weights_out}")
+	print(
+		"Test metrics: "
+		+ ", ".join(f"{name}={value:.6f}" for name, value in results.items())
+	)
 
 
 if __name__ == "__main__":

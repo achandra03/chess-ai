@@ -7,9 +7,12 @@ import tensorflow as tf
 from position_encoding import (
 	ATTACK_FEATURE_SIZE,
 	FEATURE_SIZE,
+	PAPER_BITMAP_FEATURE_SIZE,
 	PERSPECTIVE_FEATURE_SIZE,
 	encode_board,
+	encode_board_paper_bitmap,
 	encode_board_perspective,
+	paper_target_to_pawns,
 )
 
 
@@ -31,12 +34,14 @@ class Engine:
 			None,
 			FEATURE_SIZE,
 			ATTACK_FEATURE_SIZE,
+			PAPER_BITMAP_FEATURE_SIZE,
 			PERSPECTIVE_FEATURE_SIZE,
 		):
 			raise ValueError(
 				f"unsupported evaluator input size {self.model_input_size}; "
 				f"expected {FEATURE_SIZE}, {ATTACK_FEATURE_SIZE}, "
-				f"{PERSPECTIVE_FEATURE_SIZE}, or legacy 128"
+				f"{PAPER_BITMAP_FEATURE_SIZE}, {PERSPECTIVE_FEATURE_SIZE}, "
+				"or legacy 128"
 			)
 
 	def _resolve_model_path(self, model_path):
@@ -48,6 +53,7 @@ class Engine:
 
 		model_dir = Path(__file__).resolve().parent
 		for name in (
+			"position_evaluator_paper_mlp.keras",
 			"position_evaluator_cnn_v2.keras",
 			"position_evaluator_cnn_attacks.keras",
 			"position_evaluator_cnn.keras",
@@ -115,6 +121,11 @@ class Engine:
 		return self._run_layers(self.nn, inp, 3)
 
 	def nn_input(self):
+		if self.model_input_size == PAPER_BITMAP_FEATURE_SIZE:
+			return encode_board_paper_bitmap(self.board).reshape(
+				1, PAPER_BITMAP_FEATURE_SIZE
+			)
+
 		if self.model_input_size == PERSPECTIVE_FEATURE_SIZE:
 			return encode_board_perspective(self.board).reshape(
 				1, PERSPECTIVE_FEATURE_SIZE
@@ -131,7 +142,10 @@ class Engine:
 
 	def eval_position(self):
 		eval_tensor = self._predict_model(self.nn_input())
-		return float(np.asarray(eval_tensor)[0][0])
+		score = float(np.asarray(eval_tensor)[0][0])
+		if self.model_input_size == PAPER_BITMAP_FEATURE_SIZE:
+			return paper_target_to_pawns(score)
+		return score
 
 	def eval_position_for(self, root_white):
 		side_to_move_is_white = self.board.turn == 0
