@@ -17,15 +17,17 @@ from position_encoding import (
 
 
 MATE_SCORE = 100000.0
+DEFAULT_SEARCH_DEPTH = 1
 
 
 class Engine:
-	def __init__(self, board, model_path=None, depth=3):
+	def __init__(self, board, model_path=None, depth=DEFAULT_SEARCH_DEPTH):
 		self.board = board
 		self.depth = depth
 		self.model_path = self._resolve_model_path(model_path)
 		self.nn, self.model_kind = self._load_model(self.model_path)
 		self.model_input_size = self._model_input_size(self.nn, self.model_kind)
+		self.paper_output_is_normalized = self._paper_output_is_normalized()
 		self.encoder = None
 
 		if self.model_input_size == 128:
@@ -53,6 +55,7 @@ class Engine:
 
 		model_dir = Path(__file__).resolve().parent
 		for name in (
+			"position_evaluator_paper_mlp_mae.keras",
 			"position_evaluator_paper_mlp.keras",
 			"position_evaluator_cnn_v2.keras",
 			"position_evaluator_cnn_attacks.keras",
@@ -143,9 +146,22 @@ class Engine:
 	def eval_position(self):
 		eval_tensor = self._predict_model(self.nn_input())
 		score = float(np.asarray(eval_tensor)[0][0])
-		if self.model_input_size == PAPER_BITMAP_FEATURE_SIZE:
+		if self.paper_output_is_normalized:
 			return paper_target_to_pawns(score)
 		return score
+
+	def _paper_output_is_normalized(self):
+		if self.model_input_size != PAPER_BITMAP_FEATURE_SIZE:
+			return False
+		if self.model_kind == "keras":
+			output_names = list(getattr(self.nn, "output_names", []))
+			layer_name = getattr(self.nn.layers[-1], "name", "")
+			names = set(output_names + [layer_name])
+			if "side_to_move_pawn_score" in names:
+				return False
+			if "normalized_evaluation" in names:
+				return True
+		return "mae" not in self.model_path.stem
 
 	def eval_position_for(self, root_white):
 		side_to_move_is_white = self.board.turn == 0
@@ -169,13 +185,12 @@ class Engine:
 		return 0.0
 
 	def minimax(self, depth, root_white, alpha, beta):
-		if depth == 0:
-			return self.eval_position_for(root_white), None
-
 		side_to_move_is_white = self.board.turn == 0
 		moves = self.board.allMoves(side_to_move_is_white)
 		if len(moves) == 0:
 			return self.terminal_eval_for(root_white), None
+		if depth == 0:
+			return self.eval_position_for(root_white), None
 
 		if side_to_move_is_white == root_white:
 			best = -MATE_SCORE
@@ -217,5 +232,4 @@ class Engine:
 			raise ValueError("selectMove side does not match board.turn")
 		root_white = self.board.turn == 0
 		best_eval, best_move = self.minimax(self.depth, root_white, -MATE_SCORE, MATE_SCORE)
-		print(best_eval)
 		return best_move

@@ -22,6 +22,7 @@ ATTACK_PLANE_COUNT = len(PIECE_PLANES)
 BOARD_FEATURE_SIZE = BOARD_SIZE * BOARD_SIZE * PIECE_PLANE_COUNT
 PAPER_BITMAP_FEATURE_SIZE = BOARD_FEATURE_SIZE
 PAPER_MAX_ABS_CENTIPAWNS = 5000
+PAPER_PAWN_TARGET_LIMIT = 10.0
 ATTACK_BOARD_FEATURE_SIZE = BOARD_SIZE * BOARD_SIZE * (
 	PIECE_PLANE_COUNT + ATTACK_PLANE_COUNT
 )
@@ -76,6 +77,13 @@ def evaluation_to_paper_target(
 	return float(
 		(centipawns + max_abs_centipawns) / (2.0 * max_abs_centipawns)
 	)
+
+
+def evaluation_to_paper_pawns(
+	evaluation, max_abs_pawns=PAPER_PAWN_TARGET_LIMIT
+):
+	"""Convert a Stockfish score to a clipped pawn value for the paper bitmap MLP."""
+	return evaluation_to_pawns(evaluation, max_abs_pawns=max_abs_pawns)
 
 
 def paper_target_to_pawns(

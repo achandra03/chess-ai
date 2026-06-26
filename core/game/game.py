@@ -33,7 +33,7 @@ class Game:
 			self.piece_mapping[file] = piece
 
 		self.clickedOn = None
-		self.engine = Engine(self.board)
+		self.engine = Engine(self.board, depth=1)
 
 
 	def move(self, x, y, newX, newY):

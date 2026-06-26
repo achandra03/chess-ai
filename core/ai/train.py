@@ -12,17 +12,18 @@ import tensorflow as tf
 
 from position_encoding import (
 	PAPER_BITMAP_FEATURE_SIZE,
-	PAPER_MAX_ABS_CENTIPAWNS,
 	encode_fen_paper_bitmap,
-	evaluation_to_paper_target,
+	evaluation_to_paper_pawns,
 )
 
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 AI_DIR = Path(__file__).resolve().parent
 DEFAULT_DATA_FILE = ROOT_DIR / "data" / "chessData_depth8.csv"
-DEFAULT_MODEL_OUT = AI_DIR / "position_evaluator_paper_mlp.keras"
-DEFAULT_WEIGHTS_OUT = AI_DIR / "position_evaluator_paper_mlp.weights.h5"
+DEFAULT_MODEL_OUT = AI_DIR / "position_evaluator_paper_mlp_mae.keras"
+DEFAULT_WEIGHTS_OUT = AI_DIR / "position_evaluator_paper_mlp_mae.weights.h5"
+DEFAULT_LEARNING_RATE = 0.0001
+DEFAULT_MAX_ABS_PAWNS = 10.0
 
 
 def parse_args():
@@ -42,7 +43,7 @@ def parse_args():
 		),
 	)
 	parser.add_argument("--batch-size", type=int, default=248)
-	parser.add_argument("--learning-rate", type=float, default=0.001)
+	parser.add_argument("--learning-rate", type=float, default=DEFAULT_LEARNING_RATE)
 	parser.add_argument("--momentum", type=float, default=0.7)
 	parser.add_argument(
 		"--sample-size",
@@ -64,14 +65,10 @@ def parse_args():
 		help="Seed for the deterministic 80/10/10 position split.",
 	)
 	parser.add_argument(
-		"--max-abs-centipawns",
-		type=int,
-		default=PAPER_MAX_ABS_CENTIPAWNS,
-		help=(
-			"Clip evaluations to this range before mapping them to [0, 1]. "
-			"The thesis omits the clipping formula; 5000 matches the original "
-			"project preprocessing."
-		),
+		"--max-abs-pawns",
+		type=float,
+		default=DEFAULT_MAX_ABS_PAWNS,
+		help="Clip evaluations to this pawn range before training.",
 	)
 	parser.add_argument("--shuffle-buffer", type=int, default=100_000)
 	parser.add_argument(
@@ -127,8 +124,8 @@ def validate_args(args):
 		raise ValueError("--momentum must be in [0, 1)")
 	if args.sample_size < 0:
 		raise ValueError("--sample-size cannot be negative")
-	if args.max_abs_centipawns < 1:
-		raise ValueError("--max-abs-centipawns must be positive")
+	if args.max_abs_pawns <= 0:
+		raise ValueError("--max-abs-pawns must be positive")
 	if args.shuffle_buffer < 0:
 		raise ValueError("--shuffle-buffer cannot be negative")
 	if args.max_rows is not None and args.max_rows < 1:
@@ -141,7 +138,11 @@ def validate_args(args):
 		raise ValueError("--weights-out must end with .weights.h5")
 
 
-def build_model(learning_rate=0.001, momentum=0.7):
+def build_model(
+	learning_rate=DEFAULT_LEARNING_RATE,
+	momentum=0.7,
+	max_abs_pawns=DEFAULT_MAX_ABS_PAWNS,
+):
 	inputs = tf.keras.Input(
 		shape=(PAPER_BITMAP_FEATURE_SIZE,), name="bitmap_position"
 	)
@@ -150,9 +151,16 @@ def build_model(learning_rate=0.001, momentum=0.7):
 	x = tf.keras.layers.Dense(2048, activation="elu", name="hidden_2")(x)
 	x = tf.keras.layers.BatchNormalization(name="batch_norm_2")(x)
 	x = tf.keras.layers.Dense(2048, activation="elu", name="hidden_3")(x)
-	outputs = tf.keras.layers.Dense(
-		1, activation="sigmoid", name="normalized_evaluation"
+	unit_score = tf.keras.layers.Dense(
+		1,
+		activation="tanh",
+		kernel_initializer="zeros",
+		bias_initializer="zeros",
+		name="bounded_unit_score",
 	)(x)
+	outputs = tf.keras.layers.Rescaling(
+		scale=max_abs_pawns, name="side_to_move_pawn_score"
+	)(unit_score)
 
 	model = tf.keras.Model(
 		inputs=inputs,
@@ -165,12 +173,8 @@ def build_model(learning_rate=0.001, momentum=0.7):
 			momentum=momentum,
 			nesterov=True,
 		),
-		loss=tf.keras.losses.MeanSquaredError(),
-		metrics=[
-			tf.keras.metrics.MeanSquaredError(name="mse"),
-			tf.keras.metrics.RootMeanSquaredError(name="rmse"),
-			tf.keras.metrics.MeanAbsoluteError(name="mae"),
-		],
+		loss=tf.keras.losses.MeanAbsoluteError(),
+		metrics=[tf.keras.metrics.MeanAbsoluteError(name="mae")],
 	)
 	return model
 
@@ -251,7 +255,7 @@ def iter_examples(
 	sample_fraction,
 	sample_seed,
 	split_seed,
-	max_abs_centipawns,
+	max_abs_pawns,
 ):
 	with path.open(newline="") as file:
 		reader = csv.DictReader(file)
@@ -266,9 +270,9 @@ def iter_examples(
 				continue
 
 			features = encode_fen_paper_bitmap(fen)
-			target = evaluation_to_paper_target(
+			target = evaluation_to_paper_pawns(
 				row["Evaluation"],
-				max_abs_centipawns=max_abs_centipawns,
+				max_abs_pawns=max_abs_pawns,
 			)
 			yield features, np.array([target], dtype=np.float32)
 
@@ -282,7 +286,7 @@ def make_dataset(args, raw_rows, split, sample_fraction, repeat=False):
 			sample_fraction=sample_fraction,
 			sample_seed=args.sample_seed,
 			split_seed=args.split_seed,
-			max_abs_centipawns=args.max_abs_centipawns,
+			max_abs_pawns=args.max_abs_pawns,
 		),
 		output_signature=(
 			tf.TensorSpec(
@@ -329,7 +333,7 @@ def main():
 	if split_counts["train"] == 0:
 		raise ValueError("deterministic sample contains no training rows")
 
-	print("Experiment: Sabatelli Dataset 4 bitmap MLP")
+	print("Experiment: Sabatelli Dataset 4 bitmap MLP with pawn-scale MAE")
 	print(f"Data file: {args.data_file}")
 	print(f"Source rows considered: {raw_rows}")
 	print(
@@ -343,10 +347,8 @@ def main():
 		f"{split_counts['test']} test"
 	)
 	print(f"Input: {PAPER_BITMAP_FEATURE_SIZE} binary bitmap values")
-	print(
-		"Target: [-"
-		f"{args.max_abs_centipawns}, +{args.max_abs_centipawns}] cp -> [0, 1]"
-	)
+	print(f"Target: clipped to [-{args.max_abs_pawns:g}, +{args.max_abs_pawns:g}] pawns")
+	print("Loss/metric: MAE in pawns")
 	print(
 		f"Optimizer: SGD(lr={args.learning_rate:g}, momentum={args.momentum:g}, "
 		"nesterov=True)"
@@ -363,7 +365,11 @@ def main():
 	)
 	test_dataset = make_dataset(args, raw_rows, "test", sample_fraction)
 
-	model = build_model(args.learning_rate, args.momentum)
+	model = build_model(
+		args.learning_rate,
+		args.momentum,
+		max_abs_pawns=args.max_abs_pawns,
+	)
 	if args.dry_run:
 		for features, targets in train_dataset.take(1):
 			print(f"features: {features.shape} {features.dtype}")
@@ -391,13 +397,13 @@ def main():
 	callbacks = [
 		tf.keras.callbacks.ModelCheckpoint(
 			filepath=str(args.model_out),
-			monitor="val_loss",
+			monitor="val_mae",
 			mode="min",
 			save_best_only=True,
 		),
 		tf.keras.callbacks.ModelCheckpoint(
 			filepath=str(args.weights_out),
-			monitor="val_loss",
+			monitor="val_mae",
 			mode="min",
 			save_best_only=True,
 			save_weights_only=True,
