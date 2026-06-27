@@ -1,4 +1,5 @@
 import numpy as np
+import tensorflow as tf
 
 
 BOARD_SIZE = 8
@@ -38,6 +39,31 @@ RELATIVE_PIECE_PLANES = {
 	"q": 4,
 	"k": 5,
 }
+
+
+@tf.keras.utils.register_keras_serializable(package="ChessAI")
+class SquarePositionEmbedding(tf.keras.layers.Layer):
+	"""Add a learned absolute embedding for each of the 64 board squares."""
+
+	def __init__(self, square_count=BOARD_SIZE * BOARD_SIZE, **kwargs):
+		super().__init__(**kwargs)
+		self.square_count = square_count
+
+	def build(self, input_shape):
+		self.position_embeddings = self.add_weight(
+			name="position_embeddings",
+			shape=(self.square_count, int(input_shape[-1])),
+			initializer="random_normal",
+			trainable=True,
+		)
+
+	def call(self, inputs):
+		return inputs + self.position_embeddings[tf.newaxis, :, :]
+
+	def get_config(self):
+		config = super().get_config()
+		config.update({"square_count": self.square_count})
+		return config
 
 
 def evaluation_to_pawns(evaluation, max_abs_pawns=10.0):

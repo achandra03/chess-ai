@@ -55,6 +55,7 @@ class Engine:
 
 		model_dir = Path(__file__).resolve().parent
 		for name in (
+			"position_evaluator_transformer_mae.keras",
 			"position_evaluator_paper_mlp_mae.keras",
 			"position_evaluator_paper_mlp.keras",
 			"position_evaluator_cnn_v2.keras",

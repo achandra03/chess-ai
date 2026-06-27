@@ -12,6 +12,7 @@ import tensorflow as tf
 
 from position_encoding import (
 	PAPER_BITMAP_FEATURE_SIZE,
+	SquarePositionEmbedding,
 	encode_fen_paper_bitmap,
 	evaluation_to_paper_pawns,
 )
@@ -20,19 +21,46 @@ from position_encoding import (
 ROOT_DIR = Path(__file__).resolve().parents[2]
 AI_DIR = Path(__file__).resolve().parent
 DEFAULT_DATA_FILE = ROOT_DIR / "data" / "chessData_depth8.csv"
-DEFAULT_MODEL_OUT = AI_DIR / "position_evaluator_paper_mlp_mae.keras"
-DEFAULT_WEIGHTS_OUT = AI_DIR / "position_evaluator_paper_mlp_mae.weights.h5"
+ARCHITECTURE_PAPER_MLP = "paper-mlp"
+ARCHITECTURE_TRANSFORMER = "transformer"
+DEFAULT_ARCHITECTURE = ARCHITECTURE_TRANSFORMER
+DEFAULT_OUTPUTS = {
+	ARCHITECTURE_PAPER_MLP: (
+		AI_DIR / "position_evaluator_paper_mlp_mae.keras",
+		AI_DIR / "position_evaluator_paper_mlp_mae.weights.h5",
+	),
+	ARCHITECTURE_TRANSFORMER: (
+		AI_DIR / "position_evaluator_transformer_mae.keras",
+		AI_DIR / "position_evaluator_transformer_mae.weights.h5",
+	),
+}
 DEFAULT_LEARNING_RATE = 0.0001
 DEFAULT_MAX_ABS_PAWNS = 10.0
 
 
 def parse_args():
 	parser = argparse.ArgumentParser(
-		description="Train the Sabatelli-style depth-8 bitmap MLP evaluator."
+		description="Train a depth-8 bitmap chess position evaluator."
 	)
 	parser.add_argument("--data-file", type=Path, default=DEFAULT_DATA_FILE)
-	parser.add_argument("--model-out", type=Path, default=DEFAULT_MODEL_OUT)
-	parser.add_argument("--weights-out", type=Path, default=DEFAULT_WEIGHTS_OUT)
+	parser.add_argument(
+		"--architecture",
+		choices=(ARCHITECTURE_PAPER_MLP, ARCHITECTURE_TRANSFORMER),
+		default=DEFAULT_ARCHITECTURE,
+		help="Model architecture to train.",
+	)
+	parser.add_argument(
+		"--model-out",
+		type=Path,
+		default=None,
+		help="Output .keras checkpoint. Defaults depend on --architecture.",
+	)
+	parser.add_argument(
+		"--weights-out",
+		type=Path,
+		default=None,
+		help="Output .weights.h5 checkpoint. Defaults depend on --architecture.",
+	)
 	parser.add_argument(
 		"--epochs",
 		type=int,
@@ -45,6 +73,26 @@ def parse_args():
 	parser.add_argument("--batch-size", type=int, default=248)
 	parser.add_argument("--learning-rate", type=float, default=DEFAULT_LEARNING_RATE)
 	parser.add_argument("--momentum", type=float, default=0.7)
+	parser.add_argument(
+		"--optimizer",
+		choices=("auto", "sgd", "adamw", "adam"),
+		default="auto",
+		help=(
+			"Optimizer to use. auto uses SGD for the paper MLP and AdamW "
+			"for the transformer."
+		),
+	)
+	parser.add_argument(
+		"--weight-decay",
+		type=float,
+		default=1e-4,
+		help="AdamW weight decay for transformer training.",
+	)
+	parser.add_argument("--transformer-d-model", type=int, default=128)
+	parser.add_argument("--transformer-heads", type=int, default=8)
+	parser.add_argument("--transformer-layers", type=int, default=4)
+	parser.add_argument("--transformer-ff-dim", type=int, default=512)
+	parser.add_argument("--transformer-dropout", type=float, default=0.1)
 	parser.add_argument(
 		"--sample-size",
 		type=int,
@@ -100,7 +148,14 @@ def parse_args():
 		action="store_true",
 		help="Inspect one batch and the model without training.",
 	)
-	return parser.parse_args()
+	args = parser.parse_args()
+	if args.model_out is None or args.weights_out is None:
+		default_model_out, default_weights_out = DEFAULT_OUTPUTS[args.architecture]
+		if args.model_out is None:
+			args.model_out = default_model_out
+		if args.weights_out is None:
+			args.weights_out = default_weights_out
+	return args
 
 
 def configure_tensorflow():
@@ -122,6 +177,20 @@ def validate_args(args):
 		raise ValueError("--learning-rate must be positive")
 	if args.momentum < 0 or args.momentum >= 1:
 		raise ValueError("--momentum must be in [0, 1)")
+	if args.weight_decay < 0:
+		raise ValueError("--weight-decay cannot be negative")
+	if args.transformer_d_model < 1:
+		raise ValueError("--transformer-d-model must be positive")
+	if args.transformer_heads < 1:
+		raise ValueError("--transformer-heads must be positive")
+	if args.transformer_d_model % args.transformer_heads != 0:
+		raise ValueError("--transformer-d-model must be divisible by --transformer-heads")
+	if args.transformer_layers < 1:
+		raise ValueError("--transformer-layers must be positive")
+	if args.transformer_ff_dim < 1:
+		raise ValueError("--transformer-ff-dim must be positive")
+	if args.transformer_dropout < 0 or args.transformer_dropout >= 1:
+		raise ValueError("--transformer-dropout must be in [0, 1)")
 	if args.sample_size < 0:
 		raise ValueError("--sample-size cannot be negative")
 	if args.max_abs_pawns <= 0:
@@ -138,11 +207,7 @@ def validate_args(args):
 		raise ValueError("--weights-out must end with .weights.h5")
 
 
-def build_model(
-	learning_rate=DEFAULT_LEARNING_RATE,
-	momentum=0.7,
-	max_abs_pawns=DEFAULT_MAX_ABS_PAWNS,
-):
+def build_paper_mlp_model(max_abs_pawns=DEFAULT_MAX_ABS_PAWNS):
 	inputs = tf.keras.Input(
 		shape=(PAPER_BITMAP_FEATURE_SIZE,), name="bitmap_position"
 	)
@@ -167,16 +232,164 @@ def build_model(
 		outputs=outputs,
 		name="sabatelli_bitmap_mlp",
 	)
-	model.compile(
-		optimizer=tf.keras.optimizers.SGD(
-			learning_rate=learning_rate,
-			momentum=momentum,
+	return model
+
+
+def transformer_encoder_block(
+	x,
+	d_model,
+	heads,
+	ff_dim,
+	dropout,
+	block_index,
+):
+	attention_input = tf.keras.layers.LayerNormalization(
+		epsilon=1e-6, name=f"transformer_{block_index}_attention_norm"
+	)(x)
+	attention_output = tf.keras.layers.MultiHeadAttention(
+		num_heads=heads,
+		key_dim=d_model // heads,
+		dropout=dropout,
+		name=f"transformer_{block_index}_attention",
+	)(attention_input, attention_input)
+	attention_output = tf.keras.layers.Dropout(
+		dropout, name=f"transformer_{block_index}_attention_dropout"
+	)(attention_output)
+	x = tf.keras.layers.Add(name=f"transformer_{block_index}_attention_residual")(
+		[x, attention_output]
+	)
+
+	ffn_input = tf.keras.layers.LayerNormalization(
+		epsilon=1e-6, name=f"transformer_{block_index}_ffn_norm"
+	)(x)
+	ffn_output = tf.keras.layers.Dense(
+		ff_dim, activation="gelu", name=f"transformer_{block_index}_ffn_expand"
+	)(ffn_input)
+	ffn_output = tf.keras.layers.Dropout(
+		dropout, name=f"transformer_{block_index}_ffn_dropout_1"
+	)(ffn_output)
+	ffn_output = tf.keras.layers.Dense(
+		d_model, name=f"transformer_{block_index}_ffn_project"
+	)(ffn_output)
+	ffn_output = tf.keras.layers.Dropout(
+		dropout, name=f"transformer_{block_index}_ffn_dropout_2"
+	)(ffn_output)
+	return tf.keras.layers.Add(name=f"transformer_{block_index}_ffn_residual")(
+		[x, ffn_output]
+	)
+
+
+def build_transformer_model(
+	d_model=128,
+	heads=8,
+	layers=4,
+	ff_dim=512,
+	dropout=0.1,
+	max_abs_pawns=DEFAULT_MAX_ABS_PAWNS,
+):
+	inputs = tf.keras.Input(
+		shape=(PAPER_BITMAP_FEATURE_SIZE,), name="bitmap_position"
+	)
+	x = tf.keras.layers.Reshape((64, 12), name="square_piece_planes")(inputs)
+	x = tf.keras.layers.Dense(d_model, name="square_projection")(x)
+	x = SquarePositionEmbedding(name="square_position_embedding")(x)
+	x = tf.keras.layers.Dropout(dropout, name="input_dropout")(x)
+
+	for block_index in range(1, layers + 1):
+		x = transformer_encoder_block(
+			x=x,
+			d_model=d_model,
+			heads=heads,
+			ff_dim=ff_dim,
+			dropout=dropout,
+			block_index=block_index,
+		)
+
+	x = tf.keras.layers.LayerNormalization(epsilon=1e-6, name="final_norm")(x)
+	x = tf.keras.layers.GlobalAveragePooling1D(name="square_mean_pool")(x)
+	x = tf.keras.layers.Dense(
+		ff_dim, activation="gelu", name="evaluation_head_hidden"
+	)(x)
+	x = tf.keras.layers.Dropout(dropout, name="evaluation_head_dropout")(x)
+	unit_score = tf.keras.layers.Dense(
+		1,
+		activation="tanh",
+		kernel_initializer="zeros",
+		bias_initializer="zeros",
+		name="bounded_unit_score",
+	)(x)
+	outputs = tf.keras.layers.Rescaling(
+		scale=max_abs_pawns, name="side_to_move_pawn_score"
+	)(unit_score)
+
+	return tf.keras.Model(
+		inputs=inputs,
+		outputs=outputs,
+		name="bitmap_transformer",
+	)
+
+
+def resolved_optimizer_name(args):
+	if args.optimizer != "auto":
+		return args.optimizer
+	if args.architecture == ARCHITECTURE_TRANSFORMER:
+		return "adamw"
+	return "sgd"
+
+
+def build_optimizer(args):
+	optimizer_name = resolved_optimizer_name(args)
+	if optimizer_name == "sgd":
+		return tf.keras.optimizers.SGD(
+			learning_rate=args.learning_rate,
+			momentum=args.momentum,
 			nesterov=True,
-		),
+		)
+	if optimizer_name == "adamw":
+		return tf.keras.optimizers.AdamW(
+			learning_rate=args.learning_rate,
+			weight_decay=args.weight_decay,
+		)
+	return tf.keras.optimizers.Adam(learning_rate=args.learning_rate)
+
+
+def optimizer_description(args):
+	optimizer_name = resolved_optimizer_name(args)
+	if optimizer_name == "sgd":
+		return (
+			f"SGD(lr={args.learning_rate:g}, momentum={args.momentum:g}, "
+			"nesterov=True)"
+		)
+	if optimizer_name == "adamw":
+		return (
+			f"AdamW(lr={args.learning_rate:g}, "
+			f"weight_decay={args.weight_decay:g})"
+		)
+	return f"Adam(lr={args.learning_rate:g})"
+
+
+def compile_model(model, args):
+	model.compile(
+		optimizer=build_optimizer(args),
 		loss=tf.keras.losses.MeanAbsoluteError(),
 		metrics=[tf.keras.metrics.MeanAbsoluteError(name="mae")],
 	)
 	return model
+
+
+def build_model(args):
+	if args.architecture == ARCHITECTURE_PAPER_MLP:
+		model = build_paper_mlp_model(max_abs_pawns=args.max_abs_pawns)
+	else:
+		model = build_transformer_model(
+			d_model=args.transformer_d_model,
+			heads=args.transformer_heads,
+			layers=args.transformer_layers,
+			ff_dim=args.transformer_ff_dim,
+			dropout=args.transformer_dropout,
+			max_abs_pawns=args.max_abs_pawns,
+		)
+	return compile_model(model, args)
 
 
 def position_key(fen):
@@ -333,8 +546,18 @@ def main():
 	if split_counts["train"] == 0:
 		raise ValueError("deterministic sample contains no training rows")
 
-	print("Experiment: Sabatelli Dataset 4 bitmap MLP with pawn-scale MAE")
+	print("Experiment: depth-8 bitmap evaluator with pawn-scale MAE")
 	print(f"Data file: {args.data_file}")
+	print(f"Architecture: {args.architecture}")
+	if args.architecture == ARCHITECTURE_TRANSFORMER:
+		print(
+			"Transformer: "
+			f"d_model={args.transformer_d_model}, "
+			f"heads={args.transformer_heads}, "
+			f"layers={args.transformer_layers}, "
+			f"ff_dim={args.transformer_ff_dim}, "
+			f"dropout={args.transformer_dropout:g}"
+		)
 	print(f"Source rows considered: {raw_rows}")
 	print(
 		f"Deterministic sample: {sum(split_counts.values())} positions "
@@ -349,10 +572,7 @@ def main():
 	print(f"Input: {PAPER_BITMAP_FEATURE_SIZE} binary bitmap values")
 	print(f"Target: clipped to [-{args.max_abs_pawns:g}, +{args.max_abs_pawns:g}] pawns")
 	print("Loss/metric: MAE in pawns")
-	print(
-		f"Optimizer: SGD(lr={args.learning_rate:g}, momentum={args.momentum:g}, "
-		"nesterov=True)"
-	)
+	print(f"Optimizer: {optimizer_description(args)}")
 	print(f"Batch size: {args.batch_size}")
 	print(f"Model checkpoint: {args.model_out}")
 	print(f"Weights checkpoint: {args.weights_out}")
@@ -365,11 +585,7 @@ def main():
 	)
 	test_dataset = make_dataset(args, raw_rows, "test", sample_fraction)
 
-	model = build_model(
-		args.learning_rate,
-		args.momentum,
-		max_abs_pawns=args.max_abs_pawns,
-	)
+	model = build_model(args)
 	if args.dry_run:
 		for features, targets in train_dataset.take(1):
 			print(f"features: {features.shape} {features.dtype}")
