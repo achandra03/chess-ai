@@ -1,4 +1,6 @@
 import copy
+import importlib.util
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -9,15 +11,22 @@ from position_encoding import (
 	FEATURE_SIZE,
 	PAPER_BITMAP_FEATURE_SIZE,
 	PERSPECTIVE_FEATURE_SIZE,
+	PERSPECTIVE_V2_FEATURE_SIZE,
 	encode_board,
 	encode_board_paper_bitmap,
 	encode_board_perspective,
+	encode_board_perspective_v2,
 	paper_target_to_pawns,
 )
 
 
 MATE_SCORE = 100000.0
 DEFAULT_SEARCH_DEPTH = 1
+PERSPECTIVE_V2_WEIGHTS_NAME = "position_evaluator_perspective_transformer_v2_mae.weights.h5"
+PERSPECTIVE_WEIGHTS_NAME = "position_evaluator_perspective_transformer_mae.weights.h5"
+ATTACK_WEIGHTS_NAME = "position_evaluator_attack_transformer_mae.weights.h5"
+TRANSFORMER_WEIGHTS_NAME = "position_evaluator_transformer_mae.weights.h5"
+PAPER_MLP_WEIGHTS_NAME = "position_evaluator_paper_mlp_mae.weights.h5"
 
 
 class Engine:
@@ -38,12 +47,13 @@ class Engine:
 			ATTACK_FEATURE_SIZE,
 			PAPER_BITMAP_FEATURE_SIZE,
 			PERSPECTIVE_FEATURE_SIZE,
+			PERSPECTIVE_V2_FEATURE_SIZE,
 		):
 			raise ValueError(
 				f"unsupported evaluator input size {self.model_input_size}; "
 				f"expected {FEATURE_SIZE}, {ATTACK_FEATURE_SIZE}, "
 				f"{PAPER_BITMAP_FEATURE_SIZE}, {PERSPECTIVE_FEATURE_SIZE}, "
-				"or legacy 128"
+				f"{PERSPECTIVE_V2_FEATURE_SIZE}, or legacy 128"
 			)
 
 	def _resolve_model_path(self, model_path):
@@ -55,8 +65,16 @@ class Engine:
 
 		model_dir = Path(__file__).resolve().parent
 		for name in (
+			"position_evaluator_perspective_transformer_v2_mae.keras",
+			PERSPECTIVE_V2_WEIGHTS_NAME,
+			"position_evaluator_perspective_transformer_mae.keras",
+			PERSPECTIVE_WEIGHTS_NAME,
+			"position_evaluator_attack_transformer_mae.keras",
+			ATTACK_WEIGHTS_NAME,
 			"position_evaluator_transformer_mae.keras",
+			TRANSFORMER_WEIGHTS_NAME,
 			"position_evaluator_paper_mlp_mae.keras",
+			PAPER_MLP_WEIGHTS_NAME,
 			"position_evaluator_paper_mlp.keras",
 			"position_evaluator_cnn_v2.keras",
 			"position_evaluator_cnn_attacks.keras",
@@ -71,10 +89,74 @@ class Engine:
 		raise FileNotFoundError("no evaluator model found in core/ai")
 
 	def _load_model(self, path):
+		if path.name.endswith(".weights.h5"):
+			model = self._build_model_for_weights(path)
+			model.load_weights(str(path))
+			return model, "keras"
 		try:
 			return tf.keras.models.load_model(str(path), compile=False), "keras"
 		except Exception:
 			return tf.saved_model.load(str(path)), "saved_model"
+
+	def _load_train_module(self):
+		loaded_train = sys.modules.get("train")
+		if loaded_train is not None and hasattr(
+			loaded_train, "build_perspective_transformer_v2_model"
+		):
+			return loaded_train
+		loaded_train = sys.modules.get("chess_ai_evaluator_train")
+		if loaded_train is not None:
+			return loaded_train
+
+		train_path = Path(__file__).resolve().with_name("train.py")
+		spec = importlib.util.spec_from_file_location(
+			"chess_ai_evaluator_train", train_path
+		)
+		module = importlib.util.module_from_spec(spec)
+		sys.modules["chess_ai_evaluator_train"] = module
+		spec.loader.exec_module(module)
+		return module
+
+	def _build_model_for_weights(self, path):
+		train = self._load_train_module()
+		if path.name == PERSPECTIVE_V2_WEIGHTS_NAME:
+			return train.build_perspective_transformer_v2_model(
+				d_model=256,
+				heads=8,
+				layers=6,
+				ff_dim=1024,
+				dropout=0.1,
+			)
+		if path.name == PERSPECTIVE_WEIGHTS_NAME:
+			return train.build_perspective_transformer_model(
+				d_model=256,
+				heads=8,
+				layers=6,
+				ff_dim=1024,
+				dropout=0.1,
+			)
+		if path.name == ATTACK_WEIGHTS_NAME:
+			return train.build_attack_transformer_model(
+				d_model=256,
+				heads=8,
+				layers=6,
+				ff_dim=1024,
+				dropout=0.1,
+			)
+		if path.name == TRANSFORMER_WEIGHTS_NAME:
+			return train.build_transformer_model(
+				d_model=256,
+				heads=8,
+				layers=6,
+				ff_dim=1024,
+				dropout=0.1,
+			)
+		if path.name == PAPER_MLP_WEIGHTS_NAME:
+			return train.build_paper_mlp_model()
+		raise ValueError(
+			f"cannot infer evaluator architecture from weights file {path}; "
+			"pass a full .keras model instead"
+		)
 
 	def _model_input_size(self, model, model_kind):
 		if model_kind == "keras":
@@ -133,6 +215,11 @@ class Engine:
 		if self.model_input_size == PERSPECTIVE_FEATURE_SIZE:
 			return encode_board_perspective(self.board).reshape(
 				1, PERSPECTIVE_FEATURE_SIZE
+			)
+
+		if self.model_input_size == PERSPECTIVE_V2_FEATURE_SIZE:
+			return encode_board_perspective_v2(self.board).reshape(
+				1, PERSPECTIVE_V2_FEATURE_SIZE
 			)
 
 		include_attack_maps = self.model_input_size == ATTACK_FEATURE_SIZE

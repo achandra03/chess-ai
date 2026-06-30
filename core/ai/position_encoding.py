@@ -31,6 +31,10 @@ FEATURE_SIZE = BOARD_FEATURE_SIZE + METADATA_SIZE
 ATTACK_FEATURE_SIZE = ATTACK_BOARD_FEATURE_SIZE + METADATA_SIZE
 PERSPECTIVE_METADATA_SIZE = 6
 PERSPECTIVE_FEATURE_SIZE = ATTACK_BOARD_FEATURE_SIZE + PERSPECTIVE_METADATA_SIZE
+PERSPECTIVE_V2_METADATA_SIZE = 24
+PERSPECTIVE_V2_FEATURE_SIZE = (
+	ATTACK_BOARD_FEATURE_SIZE + PERSPECTIVE_V2_METADATA_SIZE
+)
 RELATIVE_PIECE_PLANES = {
 	"p": 0,
 	"r": 1,
@@ -39,6 +43,24 @@ RELATIVE_PIECE_PLANES = {
 	"q": 4,
 	"k": 5,
 }
+PIECE_VALUES = {
+	"p": 1.0,
+	"n": 3.0,
+	"b": 3.0,
+	"r": 5.0,
+	"q": 9.0,
+	"k": 0.0,
+}
+PHASE_WEIGHTS = {
+	"p": 0.0,
+	"n": 1.0,
+	"b": 1.0,
+	"r": 2.0,
+	"q": 4.0,
+	"k": 0.0,
+}
+MAX_SIDE_MATERIAL = 39.0
+MAX_TOTAL_PHASE = 24.0
 
 
 @tf.keras.utils.register_keras_serializable(package="ChessAI")
@@ -206,6 +228,30 @@ def encode_fen_perspective(fen, mirror_files=False):
 	)
 
 
+def encode_fen_perspective_v2(fen, mirror_files=False):
+	"""Encode a side-to-move perspective FEN with extended scalar metadata."""
+	fields = str(fen).strip().split()
+	if len(fields) < 4:
+		raise ValueError(f"invalid FEN: {fen}")
+
+	board_part, turn, castling = fields[0], fields[1], fields[2]
+	if turn not in ("w", "b"):
+		raise ValueError(f"invalid FEN turn field: {turn}")
+
+	return _encode_perspective_symbols(
+		board_symbols=_symbols_from_fen_board(board_part),
+		white_to_move=(turn == "w"),
+		castling_rights={
+			"K": "K" in castling,
+			"Q": "Q" in castling,
+			"k": "k" in castling,
+			"q": "q" in castling,
+		},
+		mirror_files=mirror_files,
+		enhanced_metadata=True,
+	)
+
+
 def encode_board_perspective(board):
 	"""Encode a live board from the side-to-move player's perspective."""
 	board_symbols = [[None for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
@@ -219,6 +265,23 @@ def encode_board_perspective(board):
 		white_to_move=_board_white_to_move(board),
 		castling_rights=_board_castling_rights(board),
 		mirror_files=False,
+	)
+
+
+def encode_board_perspective_v2(board):
+	"""Encode a live board with the v2 side-to-move perspective schema."""
+	board_symbols = [[None for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
+	for row in board.pieces:
+		for piece in row:
+			if piece is not None:
+				board_symbols[piece.y][piece.x] = piece.symbol
+
+	return _encode_perspective_symbols(
+		board_symbols=board_symbols,
+		white_to_move=_board_white_to_move(board),
+		castling_rights=_board_castling_rights(board),
+		mirror_files=False,
+		enhanced_metadata=True,
 	)
 
 
@@ -296,7 +359,11 @@ def _encode_symbols(board_symbols, white_to_move, castling_rights, include_attac
 
 
 def _encode_perspective_symbols(
-	board_symbols, white_to_move, castling_rights, mirror_files
+	board_symbols,
+	white_to_move,
+	castling_rights,
+	mirror_files,
+	enhanced_metadata=False,
 ):
 	board_features = np.zeros(
 		(BOARD_SIZE, BOARD_SIZE, PIECE_PLANE_COUNT + ATTACK_PLANE_COUNT),
@@ -329,19 +396,106 @@ def _encode_perspective_symbols(
 					feature_attack_y, feature_attack_x, attack_plane
 				] = 1.0
 
-	features = np.zeros(PERSPECTIVE_FEATURE_SIZE, dtype=np.float32)
+	feature_size = (
+		PERSPECTIVE_V2_FEATURE_SIZE
+		if enhanced_metadata
+		else PERSPECTIVE_FEATURE_SIZE
+	)
+	features = np.zeros(feature_size, dtype=np.float32)
 	features[:ATTACK_BOARD_FEATURE_SIZE] = board_features.reshape(-1)
 	metadata = features[ATTACK_BOARD_FEATURE_SIZE:]
 	metadata[0] = 1.0 if _king_in_check(board_symbols, white_to_move) else 0.0
 	metadata[1] = 1.0 if _king_in_check(board_symbols, not white_to_move) else 0.0
 
-	if white_to_move:
-		castling_keys = ("K", "Q", "k", "q")
-	else:
-		castling_keys = ("k", "q", "K", "Q")
+	castling_keys = _perspective_castling_keys(white_to_move, mirror_files)
 	for index, key in enumerate(castling_keys, start=2):
 		metadata[index] = 1.0 if castling_rights.get(key, False) else 0.0
+
+	if enhanced_metadata:
+		metadata[PERSPECTIVE_METADATA_SIZE:] = _perspective_extra_metadata(
+			board_symbols=board_symbols,
+			white_to_move=white_to_move,
+		)
 	return features
+
+
+def _perspective_castling_keys(white_to_move, mirror_files):
+	if white_to_move:
+		own_keys = ("K", "Q")
+		opponent_keys = ("k", "q")
+	else:
+		own_keys = ("k", "q")
+		opponent_keys = ("K", "Q")
+
+	if mirror_files:
+		own_keys = (own_keys[1], own_keys[0])
+		opponent_keys = (opponent_keys[1], opponent_keys[0])
+	return own_keys + opponent_keys
+
+
+def _perspective_extra_metadata(board_symbols, white_to_move):
+	own_counts = _empty_piece_counts()
+	opponent_counts = _empty_piece_counts()
+	own_attacks = set()
+	opponent_attacks = set()
+
+	for y, row in enumerate(board_symbols):
+		for x, symbol in enumerate(row):
+			if symbol is None:
+				continue
+
+			counts = own_counts
+			attacks = own_attacks
+			if symbol.isupper() != white_to_move:
+				counts = opponent_counts
+				attacks = opponent_attacks
+			piece_type = symbol.lower()
+			counts[piece_type] += 1
+			attacks.update(_piece_attack_squares(board_symbols, y, x, symbol))
+
+	own_material = _material_count(own_counts)
+	opponent_material = _material_count(opponent_counts)
+	total_phase = _phase_count(own_counts) + _phase_count(opponent_counts)
+
+	return np.array(
+		[
+			(own_material - opponent_material) / MAX_SIDE_MATERIAL,
+			own_material / MAX_SIDE_MATERIAL,
+			opponent_material / MAX_SIDE_MATERIAL,
+			total_phase / MAX_TOTAL_PHASE,
+			_piece_count(own_counts) / 16.0,
+			_piece_count(opponent_counts) / 16.0,
+			own_counts["p"] / 8.0,
+			opponent_counts["p"] / 8.0,
+			(own_counts["n"] + own_counts["b"]) / 4.0,
+			(opponent_counts["n"] + opponent_counts["b"]) / 4.0,
+			own_counts["r"] / 2.0,
+			opponent_counts["r"] / 2.0,
+			own_counts["q"],
+			opponent_counts["q"],
+			1.0 if own_counts["b"] >= 2 else 0.0,
+			1.0 if opponent_counts["b"] >= 2 else 0.0,
+			len(own_attacks) / 64.0,
+			len(opponent_attacks) / 64.0,
+		],
+		dtype=np.float32,
+	)
+
+
+def _empty_piece_counts():
+	return {piece_type: 0 for piece_type in RELATIVE_PIECE_PLANES}
+
+
+def _material_count(counts):
+	return sum(PIECE_VALUES[piece_type] * count for piece_type, count in counts.items())
+
+
+def _phase_count(counts):
+	return sum(PHASE_WEIGHTS[piece_type] * count for piece_type, count in counts.items())
+
+
+def _piece_count(counts):
+	return sum(counts.values())
 
 
 def _piece_attack_squares(board_symbols, y, x, symbol):

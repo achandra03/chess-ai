@@ -1,9 +1,32 @@
 import os
 import sys
-sys.path.append(os.path.abspath('../ai'))
+from pathlib import Path
+
+GAME_DIR = Path(__file__).resolve().parent
+AI_DIR = GAME_DIR.parent / "ai"
+ASSET_DIR = GAME_DIR / "assets"
+
+sys.path.append(str(AI_DIR))
 import pygame
 from board import Board
 from engine import Engine
+
+
+DEFAULT_EVALUATOR_WEIGHTS = (
+	AI_DIR / "position_evaluator_perspective_transformer_mae.weights.h5"
+)
+DEFAULT_EVALUATOR_V2_WEIGHTS = (
+	AI_DIR / "position_evaluator_perspective_transformer_v2_mae.weights.h5"
+)
+
+
+def default_evaluator_path():
+	if DEFAULT_EVALUATOR_V2_WEIGHTS.exists():
+		return str(DEFAULT_EVALUATOR_V2_WEIGHTS)
+	if DEFAULT_EVALUATOR_WEIGHTS.exists():
+		return str(DEFAULT_EVALUATOR_WEIGHTS)
+	return None
+
 
 class Game:
 
@@ -15,25 +38,26 @@ class Game:
 		self.screen = pygame.display.set_mode(size)
 		pygame.display.set_caption('Chess')
 		square_size = (64, 64)
-		self.darksquare = pygame.image.load('assets/darksquare.png')
+		self.darksquare = pygame.image.load(str(ASSET_DIR / 'darksquare.png'))
 		self.darksquare = pygame.transform.scale(self.darksquare, square_size)
-		self.lightsquare = pygame.image.load('assets/lightsquare.png')
+		self.lightsquare = pygame.image.load(str(ASSET_DIR / 'lightsquare.png'))
 		self.lightsquare = pygame.transform.scale(self.lightsquare, square_size)
 		piece_size = (55, 55)
 		self.piece_mapping = {}
-		piece_directory = 'assets/pieces/'
+		piece_directory = ASSET_DIR / 'pieces'
 		white = 255, 255, 255
 		for file in os.listdir(piece_directory):
 			if(not file.endswith('.png')):
 				continue
-			piece = pygame.image.load(piece_directory + file)
+			piece = pygame.image.load(str(piece_directory / file))
 			piece.set_colorkey(white)
 			piece.convert_alpha()
 			piece = pygame.transform.scale(piece, piece_size)
 			self.piece_mapping[file] = piece
 
 		self.clickedOn = None
-		self.engine = Engine(self.board, depth=1)
+		model_path = os.environ.get("CHESS_AI_MODEL_PATH") or default_evaluator_path()
+		self.engine = Engine(self.board, model_path=model_path, depth=1)
 
 
 	def move(self, x, y, newX, newY):
