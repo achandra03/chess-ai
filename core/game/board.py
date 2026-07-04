@@ -305,3 +305,33 @@ class Board:
 							res.append(curr)
 							self.pieces, self.turn = snapshot
 		return res
+
+
+	def captureMoves(self, w):
+		#Returns all legal captures and promotion pushes in the form (y, x, newY, newX)
+		targets = []
+		for a in range(0, 8):
+			for b in range(0, 8):
+				if(self.pieces[a][b] is not None and self.pieces[a][b].white != w):
+					targets.append((a, b))
+
+		res = []
+		for i in range(0, 8):
+			for j in range(0, 8):
+				if(self.pieces[i][j] is None or self.pieces[i][j].white != w):
+					continue
+				x = self.pieces[i][j].x
+				y = self.pieces[i][j].y
+				currTargets = targets
+				if(type(self.pieces[i][j]) is Pawn):
+					if(w and y == 1 and self.pieces[0][x] is None):
+						currTargets = targets + [(0, x)]
+					elif(not w and y == 6 and self.pieces[7][x] is None):
+						currTargets = targets + [(7, x)]
+				for a, b in currTargets:
+					snapshot = copy.deepcopy(self.pieces), self.turn
+					if(self.makeMove(x, y, b, a)):
+						curr = [y, x, a, b]
+						res.append(curr)
+						self.pieces, self.turn = snapshot
+		return res

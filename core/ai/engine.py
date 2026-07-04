@@ -18,10 +18,14 @@ from position_encoding import (
 	encode_board_perspective_v2,
 	paper_target_to_pawns,
 )
+from board_features import PIECE_VALUES
 
 
 MATE_SCORE = 100000.0
 DEFAULT_SEARCH_DEPTH = 1
+DEFAULT_QUIESCENCE_DEPTH = 6
+DELTA_MARGIN = 2.0
+PROMOTION_GAIN = 8.0
 PERSPECTIVE_V2_WEIGHTS_NAME = "position_evaluator_perspective_transformer_v2_mae.weights.h5"
 PERSPECTIVE_WEIGHTS_NAME = "position_evaluator_perspective_transformer_mae.weights.h5"
 ATTACK_WEIGHTS_NAME = "position_evaluator_attack_transformer_mae.weights.h5"
@@ -30,9 +34,18 @@ PAPER_MLP_WEIGHTS_NAME = "position_evaluator_paper_mlp_mae.weights.h5"
 
 
 class Engine:
-	def __init__(self, board, model_path=None, depth=DEFAULT_SEARCH_DEPTH):
+	def __init__(
+		self,
+		board,
+		model_path=None,
+		depth=DEFAULT_SEARCH_DEPTH,
+		quiescence=True,
+		quiescence_depth=DEFAULT_QUIESCENCE_DEPTH,
+	):
 		self.board = board
 		self.depth = depth
+		self.quiescence = quiescence
+		self.quiescence_depth = quiescence_depth
 		self.model_path = self._resolve_model_path(model_path)
 		self.nn, self.model_kind = self._load_model(self.model_path)
 		self.model_input_size = self._model_input_size(self.nn, self.model_kind)
@@ -65,8 +78,8 @@ class Engine:
 
 		model_dir = Path(__file__).resolve().parent
 		for name in (
-			"position_evaluator_perspective_transformer_v2_mae.keras",
 			PERSPECTIVE_V2_WEIGHTS_NAME,
+			"position_evaluator_perspective_transformer_v2_mae.keras",
 			"position_evaluator_perspective_transformer_mae.keras",
 			PERSPECTIVE_WEIGHTS_NAME,
 			"position_evaluator_attack_transformer_mae.keras",
@@ -125,7 +138,7 @@ class Engine:
 				heads=8,
 				layers=6,
 				ff_dim=1024,
-				dropout=0.1,
+				dropout=0.05,
 			)
 		if path.name == PERSPECTIVE_WEIGHTS_NAME:
 			return train.build_perspective_transformer_model(
@@ -272,12 +285,106 @@ class Engine:
 			return MATE_SCORE
 		return 0.0
 
+	def _capture_gain(self, move):
+		y, x, newY, newX = move
+		victim = self.board.pieces[newY][newX]
+		if victim is None:
+			# Promotion push: the only noisy move onto an empty square.
+			return PROMOTION_GAIN
+		return PIECE_VALUES[victim.symbol.lower()]
+
+	def _order_noisy_moves(self, moves):
+		def order_key(move):
+			y, x, newY, newX = move
+			attacker = self.board.pieces[y][x]
+			return (
+				-self._capture_gain(move),
+				PIECE_VALUES[attacker.symbol.lower()],
+			)
+
+		return sorted(moves, key=order_key)
+
+	def qsearch(self, qdepth, root_white, alpha, beta):
+		side_to_move_is_white = self.board.turn == 0
+		is_max = side_to_move_is_white == root_white
+
+		if self.board.checked(side_to_move_is_white):
+			# Standing pat while in check is unsound: the position may be a
+			# mate the evaluator cannot see. Search every evasion instead.
+			moves = self.board.allMoves(side_to_move_is_white)
+			if len(moves) == 0:
+				return self.terminal_eval_for(root_white)
+			if qdepth <= 0:
+				return self.eval_position_for(root_white)
+			best = -MATE_SCORE if is_max else MATE_SCORE
+			for move in moves:
+				y, x, newY, newX = move
+				snapshot = self.snapshot_board()
+				self.board.makeMove(x, y, newX, newY)
+				value = self.qsearch(qdepth - 1, root_white, alpha, beta)
+				self.restore_board(snapshot)
+				if is_max:
+					best = max(best, value)
+					alpha = max(alpha, best)
+				else:
+					best = min(best, value)
+					beta = min(beta, best)
+				if alpha >= beta:
+					break
+			return best
+
+		stand_pat = self.eval_position_for(root_white)
+		if qdepth <= 0:
+			return stand_pat
+		if is_max:
+			if stand_pat >= beta:
+				return stand_pat
+			alpha = max(alpha, stand_pat)
+		else:
+			if stand_pat <= alpha:
+				return stand_pat
+			beta = min(beta, stand_pat)
+
+		# A position with no noisy moves stands pat here; a stalemate is
+		# scored by the evaluator rather than as a draw, which is standard
+		# quiescence behavior and avoids a full legal-move scan per node.
+		best = stand_pat
+		noisy_moves = self._order_noisy_moves(
+			self.board.captureMoves(side_to_move_is_white)
+		)
+		for move in noisy_moves:
+			gain = self._capture_gain(move)
+			# Delta pruning: skip when even winning this material plus a
+			# noise margin cannot move the window.
+			if is_max and stand_pat + gain + DELTA_MARGIN <= alpha:
+				continue
+			if not is_max and stand_pat - gain - DELTA_MARGIN >= beta:
+				continue
+			y, x, newY, newX = move
+			snapshot = self.snapshot_board()
+			self.board.makeMove(x, y, newX, newY)
+			value = self.qsearch(qdepth - 1, root_white, alpha, beta)
+			self.restore_board(snapshot)
+			if is_max:
+				best = max(best, value)
+				alpha = max(alpha, best)
+			else:
+				best = min(best, value)
+				beta = min(beta, best)
+			if alpha >= beta:
+				break
+		return best
+
 	def minimax(self, depth, root_white, alpha, beta):
 		side_to_move_is_white = self.board.turn == 0
 		moves = self.board.allMoves(side_to_move_is_white)
 		if len(moves) == 0:
 			return self.terminal_eval_for(root_white), None
 		if depth == 0:
+			if self.quiescence:
+				return self.qsearch(
+					self.quiescence_depth, root_white, alpha, beta
+				), None
 			return self.eval_position_for(root_white), None
 
 		if side_to_move_is_white == root_white:

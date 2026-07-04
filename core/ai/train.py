@@ -1,11 +1,11 @@
 import argparse
 import csv
-import hashlib
 import inspect
 import json
 import math
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
@@ -26,6 +26,15 @@ from position_encoding import (
 	encode_fen_perspective,
 	encode_fen_perspective_v2,
 	evaluation_to_paper_pawns,
+	hash_fraction,
+	position_key,
+	selected_for_sample,
+	split_for_fen,
+)
+from encoded_cache import (
+	MANIFEST_NAME as CACHE_MANIFEST_NAME,
+	EncodedCache,
+	unpack_features,
 )
 
 
@@ -64,13 +73,14 @@ DEFAULT_LEARNING_RATE = 0.001
 DEFAULT_MIN_LEARNING_RATE = 0.000001
 DEFAULT_MAX_ABS_PAWNS = 10.0
 DEFAULT_EPOCHS = 50
-DEFAULT_V2_STEPS_PER_EPOCH = 20_000
 DEFAULT_SOURCE_ROWS = 12_958_035
-DEFAULT_SAMPLE_SIZE = 3_000_000
-DEFAULT_SPLIT_COUNTS = {
-	"train": 2_402_392,
-	"validation": 300_013,
-	"test": 300_099,
+DEFAULT_SAMPLE_SIZE = 0
+DEFAULT_SPLIT_COUNTS_BY_SAMPLE = {
+	3_000_000: {
+		"train": 2_402_392,
+		"validation": 300_013,
+		"test": 300_099,
+	},
 }
 DEFAULT_EXTRA_DATA_FILES = (
 	ROOT_DIR / "data" / "random_evals.csv",
@@ -80,6 +90,43 @@ DEFAULT_EXTRA_SOURCE_ROWS = {
 	"random_evals.csv": 1_000_273,
 	"tactic_evals.csv": 2_628_219,
 }
+DEFAULT_TRAIN_SPLIT_EVAL_EXAMPLES = 100_000
+
+
+def default_cache_dir_for(data_file):
+	return ROOT_DIR / "data" / "encoded" / f"{Path(data_file).stem}_perspective_v2"
+
+
+def completed_epochs_from_history(log_path):
+	"""Number of completed epochs recorded in a training history CSV."""
+	log_path = Path(log_path)
+	if not log_path.is_file():
+		return 0
+	last_epoch = -1
+	with log_path.open(newline="") as file:
+		for row in csv.DictReader(file):
+			try:
+				last_epoch = max(last_epoch, int(row["epoch"]))
+			except (KeyError, TypeError, ValueError):
+				continue
+	return last_epoch + 1
+
+
+def best_metric_from_history(log_path, metric):
+	"""Lowest value of a metric column in a training history CSV, or None."""
+	log_path = Path(log_path)
+	if not log_path.is_file():
+		return None
+	best = None
+	with log_path.open(newline="") as file:
+		for row in csv.DictReader(file):
+			try:
+				value = float(row[metric])
+			except (KeyError, TypeError, ValueError):
+				continue
+			if best is None or value < best:
+				best = value
+	return best
 
 
 def parse_args():
@@ -118,6 +165,26 @@ def parse_args():
 		help="Optional .weights.h5 checkpoint to load before training.",
 	)
 	parser.add_argument(
+		"--initial-epoch",
+		type=int,
+		default=0,
+		help=(
+			"Epoch to resume from (0-based). Offsets the warmup-cosine LR "
+			"schedule by initial-epoch * steps-per-epoch and appends to the "
+			"history CSV instead of overwriting it."
+		),
+	)
+	parser.add_argument(
+		"--resume",
+		action="store_true",
+		help=(
+			"Continue an interrupted run: load --weights-out when it exists "
+			"and derive --initial-epoch from the history CSV. Starts fresh "
+			"when there is no checkpoint yet. The checkpoint holds the best "
+			"epoch's weights, not the last epoch's."
+		),
+	)
+	parser.add_argument(
 		"--epochs",
 		type=int,
 		default=DEFAULT_EPOCHS,
@@ -126,7 +193,7 @@ def parse_args():
 			"architectures; pass a higher value for long paper-MLP runs."
 		),
 	)
-	parser.add_argument("--batch-size", type=int, default=128)
+	parser.add_argument("--batch-size", type=int, default=512)
 	parser.add_argument("--learning-rate", type=float, default=DEFAULT_LEARNING_RATE)
 	parser.add_argument("--min-learning-rate", type=float, default=DEFAULT_MIN_LEARNING_RATE)
 	parser.add_argument(
@@ -169,11 +236,17 @@ def parse_args():
 		default=1e-4,
 		help="AdamW weight decay for transformer training.",
 	)
+	parser.add_argument(
+		"--gradient-clipnorm",
+		type=float,
+		default=1.0,
+		help="Global gradient norm clip. Set to 0 to disable.",
+	)
 	parser.add_argument("--transformer-d-model", type=int, default=256)
 	parser.add_argument("--transformer-heads", type=int, default=8)
 	parser.add_argument("--transformer-layers", type=int, default=6)
 	parser.add_argument("--transformer-ff-dim", type=int, default=1024)
-	parser.add_argument("--transformer-dropout", type=float, default=0.1)
+	parser.add_argument("--transformer-dropout", type=float, default=0.05)
 	parser.add_argument(
 		"--loss",
 		choices=("mae", "huber"),
@@ -195,9 +268,47 @@ def parse_args():
 		help="Additional CSV used for training only. May be passed more than once.",
 	)
 	parser.add_argument(
-		"--no-default-extra-data",
+		"--default-extra-data",
+		action=argparse.BooleanOptionalAction,
+		default=False,
+		help=(
+			"Add data/random_evals.csv and data/tactic_evals.csv to training. "
+			"Off by default: their evaluations are far larger on average than "
+			"the depth-8 data and drown out its signal."
+		),
+	)
+	parser.add_argument(
+		"--encoded-cache-dir",
+		type=Path,
+		default=None,
+		help=(
+			"Directory of pre-encoded positions built by encode_dataset.py. "
+			"Auto-detected for perspective-transformer-v2 when present."
+		),
+	)
+	parser.add_argument(
+		"--no-encoded-cache",
 		action="store_true",
-		help="Do not automatically add data/random_evals.csv and data/tactic_evals.csv to training.",
+		help="Stream from the CSV even if an encoded cache exists.",
+	)
+	parser.add_argument(
+		"--extra-cache-dir",
+		type=Path,
+		action="append",
+		default=None,
+		help=(
+			"Pre-encoded train-only extra dataset (encode_dataset.py "
+			"--train-only). May be passed more than once."
+		),
+	)
+	parser.add_argument(
+		"--train-split-eval-examples",
+		type=int,
+		default=DEFAULT_TRAIN_SPLIT_EVAL_EXAMPLES,
+		help=(
+			"Fixed training-split subsample evaluated in inference mode after "
+			"each epoch and logged as train_split_mae. Set to 0 to disable."
+		),
 	)
 	parser.add_argument(
 		"--mirror-augmentation",
@@ -306,22 +417,36 @@ def parse_args():
 		args.report_out = args.model_out.with_suffix(".training_report.json")
 	if args.log_out is None:
 		args.log_out = args.model_out.with_suffix(".history.csv")
+	if args.resume:
+		if args.initial_weights is not None:
+			parser.error("--resume cannot be combined with --initial-weights")
+		if args.initial_epoch != 0:
+			parser.error("--resume cannot be combined with --initial-epoch")
+		if args.weights_out.is_file():
+			args.initial_weights = args.weights_out
+			args.initial_epoch = completed_epochs_from_history(args.log_out)
 	if args.extra_data_file is None:
 		args.extra_data_file = []
-	if not args.no_default_extra_data:
+	if args.default_extra_data:
 		args.extra_data_file = list(args.extra_data_file) + [
 			path for path in DEFAULT_EXTRA_DATA_FILES if path.is_file()
 		]
 	args.extra_data_file = list(dict.fromkeys(path.resolve() for path in args.extra_data_file))
+	if args.extra_cache_dir is None:
+		args.extra_cache_dir = []
 	if args.mirror_augmentation is None:
 		args.mirror_augmentation = (
 			args.architecture == ARCHITECTURE_PERSPECTIVE_TRANSFORMER_V2
 		)
-	if (
-		args.architecture == ARCHITECTURE_PERSPECTIVE_TRANSFORMER_V2
-		and args.steps_per_epoch is None
+	if args.no_encoded_cache:
+		args.encoded_cache_dir = None
+	elif (
+		args.encoded_cache_dir is None
+		and args.architecture == ARCHITECTURE_PERSPECTIVE_TRANSFORMER_V2
 	):
-		args.steps_per_epoch = DEFAULT_V2_STEPS_PER_EPOCH
+		candidate = default_cache_dir_for(args.data_file)
+		if (candidate / CACHE_MANIFEST_NAME).is_file():
+			args.encoded_cache_dir = candidate
 	return args
 
 
@@ -346,8 +471,34 @@ def validate_args(args):
 	for extra_data_file in args.extra_data_file:
 		if not extra_data_file.is_file():
 			raise FileNotFoundError(extra_data_file)
+	if args.encoded_cache_dir is not None:
+		if args.architecture != ARCHITECTURE_PERSPECTIVE_TRANSFORMER_V2:
+			raise ValueError(
+				"--encoded-cache-dir is only supported by "
+				"perspective-transformer-v2"
+			)
+		if not (args.encoded_cache_dir / CACHE_MANIFEST_NAME).is_file():
+			raise FileNotFoundError(
+				f"{args.encoded_cache_dir / CACHE_MANIFEST_NAME}; "
+				"build the cache with encode_dataset.py"
+			)
+		if args.extra_data_file:
+			raise ValueError(
+				"CSV extra data cannot be mixed with an encoded cache; "
+				"encode extras with encode_dataset.py --train-only and pass "
+				"--extra-cache-dir"
+			)
+		for extra_cache_dir in args.extra_cache_dir:
+			if not (extra_cache_dir / CACHE_MANIFEST_NAME).is_file():
+				raise FileNotFoundError(extra_cache_dir / CACHE_MANIFEST_NAME)
+	elif args.extra_cache_dir:
+		raise ValueError("--extra-cache-dir requires an encoded cache")
+	if args.train_split_eval_examples < 0:
+		raise ValueError("--train-split-eval-examples cannot be negative")
 	if args.initial_weights is not None and not args.initial_weights.is_file():
 		raise FileNotFoundError(args.initial_weights)
+	if args.initial_epoch < 0:
+		raise ValueError("--initial-epoch cannot be negative")
 	if args.epochs < 1:
 		raise ValueError("--epochs must be positive")
 	if args.batch_size < 1:
@@ -368,6 +519,8 @@ def validate_args(args):
 		raise ValueError("--momentum must be in [0, 1)")
 	if args.weight_decay < 0:
 		raise ValueError("--weight-decay cannot be negative")
+	if args.gradient_clipnorm < 0:
+		raise ValueError("--gradient-clipnorm cannot be negative")
 	if args.transformer_d_model < 1:
 		raise ValueError("--transformer-d-model must be positive")
 	if args.transformer_heads < 1:
@@ -727,6 +880,7 @@ class WarmupCosineDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
 		decay_steps,
 		warmup_steps=0,
 		min_learning_rate=0.0,
+		step_offset=0,
 		name=None,
 	):
 		super().__init__()
@@ -734,11 +888,14 @@ class WarmupCosineDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
 		self.decay_steps = max(1, int(decay_steps))
 		self.warmup_steps = max(0, int(warmup_steps))
 		self.min_learning_rate = float(min_learning_rate)
+		self.step_offset = max(0, int(step_offset))
 		self.name = name
 
 	def __call__(self, step):
 		with tf.name_scope(self.name or "WarmupCosineDecay"):
-			step = tf.cast(step, tf.float32)
+			step = tf.cast(step, tf.float32) + tf.cast(
+				self.step_offset, tf.float32
+			)
 			initial_lr = tf.cast(self.initial_learning_rate, tf.float32)
 			min_lr = tf.cast(self.min_learning_rate, tf.float32)
 			lr_range = initial_lr - min_lr
@@ -767,6 +924,7 @@ class WarmupCosineDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
 			"decay_steps": self.decay_steps,
 			"warmup_steps": self.warmup_steps,
 			"min_learning_rate": self.min_learning_rate,
+			"step_offset": self.step_offset,
 			"name": self.name,
 		}
 
@@ -804,17 +962,22 @@ def learning_rate_for_optimizer(args):
 		decay_steps=total_steps,
 		warmup_steps=warmup_steps_for_training(args),
 		min_learning_rate=args.min_learning_rate,
+		step_offset=getattr(args, "lr_schedule_step_offset", 0),
 	)
 
 
 def build_optimizer(args):
 	optimizer_name = resolved_optimizer_name(args)
 	learning_rate = learning_rate_for_optimizer(args)
+	clip_kwargs = {}
+	if args.gradient_clipnorm > 0:
+		clip_kwargs["clipnorm"] = args.gradient_clipnorm
 	if optimizer_name == "sgd":
 		return tf.keras.optimizers.SGD(
 			learning_rate=learning_rate,
 			momentum=args.momentum,
 			nesterov=True,
+			**clip_kwargs,
 		)
 	if optimizer_name == "adamw":
 		adamw_optimizer = getattr(tf.keras.optimizers, "AdamW", None)
@@ -831,11 +994,12 @@ def build_optimizer(args):
 		optimizer_kwargs = {
 			"learning_rate": learning_rate,
 			"weight_decay": args.weight_decay,
+			**clip_kwargs,
 		}
 		if "jit_compile" in inspect.signature(adamw_optimizer).parameters:
 			optimizer_kwargs["jit_compile"] = False
 		return adamw_optimizer(**optimizer_kwargs)
-	return tf.keras.optimizers.Adam(learning_rate=learning_rate)
+	return tf.keras.optimizers.Adam(learning_rate=learning_rate, **clip_kwargs)
 
 
 def learning_rate_description(args):
@@ -844,26 +1008,31 @@ def learning_rate_description(args):
 	total_steps = getattr(args, "total_train_steps", None)
 	if total_steps is None:
 		return f"lr={args.learning_rate:g}->schedule pending"
+	step_offset = getattr(args, "lr_schedule_step_offset", 0)
+	offset_description = f", step_offset={step_offset}" if step_offset else ""
 	return (
 		f"lr={args.learning_rate:g}->{args.min_learning_rate:g} "
 		f"warmup-cosine(total_steps={total_steps}, "
-		f"warmup_steps={warmup_steps_for_training(args)})"
+		f"warmup_steps={warmup_steps_for_training(args)}{offset_description})"
 	)
 
 
 def optimizer_description(args):
 	optimizer_name = resolved_optimizer_name(args)
+	clip_description = ""
+	if args.gradient_clipnorm > 0:
+		clip_description = f", clipnorm={args.gradient_clipnorm:g}"
 	if optimizer_name == "sgd":
 		return (
 			f"SGD({learning_rate_description(args)}, momentum={args.momentum:g}, "
-			"nesterov=True)"
+			f"nesterov=True{clip_description})"
 		)
 	if optimizer_name == "adamw":
 		return (
 			f"AdamW({learning_rate_description(args)}, "
-			f"weight_decay={args.weight_decay:g})"
+			f"weight_decay={args.weight_decay:g}{clip_description})"
 		)
-	return f"Adam({learning_rate_description(args)})"
+	return f"Adam({learning_rate_description(args)}{clip_description})"
 
 
 def loss_for_training(args):
@@ -878,6 +1047,28 @@ def loss_description(args):
 	return "MAE"
 
 
+class TrainSplitMae(tf.keras.callbacks.Callback):
+	"""Log inference-mode MAE on a fixed training-split subsample.
+
+	The metric reported by Keras during training is computed with dropout
+	active and, when extra datasets are mixed in, over a different label
+	distribution than validation. This callback gives a train-split number
+	that is directly comparable to val_mae.
+	"""
+
+	def __init__(self, dataset):
+		super().__init__()
+		self.dataset = dataset
+
+	def on_epoch_end(self, epoch, logs=None):
+		if logs is None:
+			return
+		results = self.model.evaluate(
+			self.dataset, verbose=0, return_dict=True
+		)
+		logs["train_split_mae"] = float(results["mae"])
+
+
 class TargetMaeStop(tf.keras.callbacks.Callback):
 	def __init__(self, target_mae, require_validation):
 		super().__init__()
@@ -888,7 +1079,10 @@ class TargetMaeStop(tf.keras.callbacks.Callback):
 		if self.target_mae <= 0:
 			return
 		logs = logs or {}
-		train_mae = logs.get("mae")
+		# Prefer the inference-mode train-split metric when it is logged;
+		# the raw training metric includes dropout noise and augmentation.
+		train_metric = "train_split_mae" if "train_split_mae" in logs else "mae"
+		train_mae = logs.get(train_metric)
 		val_mae = logs.get("val_mae")
 		if train_mae is None:
 			return
@@ -899,7 +1093,7 @@ class TargetMaeStop(tf.keras.callbacks.Callback):
 		):
 			return
 
-		metric_text = f"mae={train_mae:.6f}"
+		metric_text = f"{train_metric}={train_mae:.6f}"
 		if val_mae is not None:
 			metric_text += f", val_mae={val_mae:.6f}"
 		print(
@@ -957,35 +1151,6 @@ def build_model(args):
 	else:
 		raise ValueError(f"unknown architecture: {args.architecture}")
 	return compile_model(model, args)
-
-
-def position_key(fen):
-	fields = str(fen).strip().split()
-	if len(fields) < 4:
-		raise ValueError(f"invalid FEN: {fen}")
-	return " ".join(fields[:4])
-
-
-def hash_fraction(seed, value):
-	digest = hashlib.blake2b(
-		f"{seed}\0{value}".encode("utf-8"), digest_size=8
-	).digest()
-	return int.from_bytes(digest, "big") / 2**64
-
-
-def split_for_fen(fen, split_seed):
-	value = hash_fraction(split_seed, position_key(fen))
-	if value < 0.8:
-		return "train"
-	if value < 0.9:
-		return "validation"
-	return "test"
-
-
-def selected_for_sample(fen, sample_fraction, sample_seed):
-	if sample_fraction >= 1.0:
-		return True
-	return hash_fraction(sample_seed, position_key(fen)) < sample_fraction
 
 
 def count_source_rows(path, max_rows):
@@ -1082,45 +1247,18 @@ def iter_examples(
 				), target_array
 
 
-def iter_train_examples(args, raw_rows, sample_fraction, extra_row_counts):
-	yield from iter_examples(
-		path=args.data_file,
-		raw_rows=raw_rows,
-		split="train",
-		sample_fraction=sample_fraction,
-		sample_seed=args.sample_seed,
-		split_seed=args.split_seed,
-		max_abs_pawns=args.max_abs_pawns,
-		architecture=args.architecture,
-		augment_mirror=args.mirror_augmentation,
-	)
-	for path, extra_raw_rows in extra_row_counts.items():
-		yield from iter_examples(
+def make_example_dataset(
+	args,
+	path,
+	raw_rows,
+	split,
+	sample_fraction,
+	augment_mirror=False,
+	train_only=False,
+):
+	return tf.data.Dataset.from_generator(
+		lambda: iter_examples(
 			path=path,
-			raw_rows=extra_raw_rows,
-			split="train",
-			sample_fraction=1.0,
-			sample_seed=args.sample_seed,
-			split_seed=args.split_seed,
-			max_abs_pawns=args.max_abs_pawns,
-			architecture=args.architecture,
-			augment_mirror=args.mirror_augmentation,
-			train_only=True,
-		)
-
-
-def make_dataset(args, raw_rows, split, sample_fraction, repeat=False, extra_row_counts=None):
-	extra_row_counts = extra_row_counts or {}
-	if split == "train":
-		generator = lambda: iter_train_examples(
-			args=args,
-			raw_rows=raw_rows,
-			sample_fraction=sample_fraction,
-			extra_row_counts=extra_row_counts,
-		)
-	else:
-		generator = lambda: iter_examples(
-			path=args.data_file,
 			raw_rows=raw_rows,
 			split=split,
 			sample_fraction=sample_fraction,
@@ -1128,10 +1266,9 @@ def make_dataset(args, raw_rows, split, sample_fraction, repeat=False, extra_row
 			split_seed=args.split_seed,
 			max_abs_pawns=args.max_abs_pawns,
 			architecture=args.architecture,
-		)
-
-	dataset = tf.data.Dataset.from_generator(
-		generator,
+			augment_mirror=augment_mirror,
+			train_only=train_only,
+		),
 		output_signature=(
 			tf.TensorSpec(
 				shape=(feature_size_for_architecture(args.architecture),),
@@ -1140,15 +1277,185 @@ def make_dataset(args, raw_rows, split, sample_fraction, repeat=False, extra_row
 			tf.TensorSpec(shape=(1,), dtype=tf.float32),
 		),
 	)
-	if split == "train" and args.shuffle_buffer > 0:
-		dataset = dataset.shuffle(
-			args.shuffle_buffer,
-			seed=int(hash_fraction(args.split_seed, "shuffle") * (2**31 - 1)),
-			reshuffle_each_iteration=True,
+
+
+def make_train_dataset(args, raw_rows, sample_fraction, extra_row_counts):
+	source_datasets = []
+	source_weights = []
+	mirror_factor = 2 if args.mirror_augmentation else 1
+
+	def add_source(dataset, example_count, seed_value):
+		if args.shuffle_buffer > 0:
+			dataset = dataset.shuffle(
+				args.shuffle_buffer,
+				seed=int(hash_fraction(args.split_seed, seed_value) * (2**31 - 1)),
+				reshuffle_each_iteration=True,
+			)
+		source_datasets.append(dataset.repeat())
+		source_weights.append(float(example_count))
+
+	add_source(
+		make_example_dataset(
+			args=args,
+			path=args.data_file,
+			raw_rows=raw_rows,
+			split="train",
+			sample_fraction=sample_fraction,
+			augment_mirror=args.mirror_augmentation,
+		),
+		example_count=args.primary_train_rows * mirror_factor,
+		seed_value="shuffle:primary",
+	)
+
+	for source_index, (path, extra_raw_rows) in enumerate(extra_row_counts.items()):
+		add_source(
+			make_example_dataset(
+				args=args,
+				path=path,
+				raw_rows=extra_raw_rows,
+				split="train",
+				sample_fraction=1.0,
+				augment_mirror=args.mirror_augmentation,
+				train_only=True,
+			),
+			example_count=extra_raw_rows * mirror_factor,
+			seed_value=f"shuffle:extra:{source_index}:{path.name}",
 		)
+
+	if len(source_datasets) == 1:
+		dataset = source_datasets[0]
+	else:
+		weight_total = sum(source_weights)
+		dataset = tf.data.Dataset.sample_from_datasets(
+			source_datasets,
+			weights=[weight / weight_total for weight in source_weights],
+			seed=int(hash_fraction(args.split_seed, "source-mix") * (2**31 - 1)),
+		)
+	return dataset.batch(args.batch_size).prefetch(tf.data.AUTOTUNE)
+
+
+def make_dataset(args, raw_rows, split, sample_fraction, repeat=False):
+	dataset = make_example_dataset(
+		args=args,
+		path=args.data_file,
+		raw_rows=raw_rows,
+		split=split,
+		sample_fraction=sample_fraction,
+	)
 	if repeat:
 		dataset = dataset.repeat()
 	return dataset.batch(args.batch_size).prefetch(tf.data.AUTOTUNE)
+
+
+def make_cached_batch_fetcher(cache, max_abs_pawns):
+	boards = cache.boards
+	metadata = cache.metadata
+	targets = cache.targets
+	clip = float(max_abs_pawns) if max_abs_pawns < cache.max_abs_pawns else None
+
+	def fetch(batch_indices, mirror_flags):
+		batch_indices = np.asarray(batch_indices)
+		batch_targets = targets[batch_indices].astype(np.float32)
+		if clip is not None:
+			batch_targets = np.clip(batch_targets, -clip, clip)
+		features = unpack_features(
+			boards[batch_indices],
+			metadata[batch_indices],
+			mirror_mask=np.asarray(mirror_flags, dtype=bool),
+		)
+		return features, batch_targets[:, np.newaxis]
+
+	return fetch
+
+
+def make_cached_dataset(
+	cache,
+	indices,
+	args,
+	shuffle=False,
+	repeat=False,
+	mirror=False,
+	seed=0,
+):
+	"""Batched (features, target) dataset over rows of an encoded cache."""
+	fetch = make_cached_batch_fetcher(cache, args.max_abs_pawns)
+	dataset = tf.data.Dataset.from_tensor_slices(np.asarray(indices, dtype=np.int64))
+	if shuffle:
+		dataset = dataset.shuffle(
+			len(indices), seed=seed, reshuffle_each_iteration=True
+		)
+	if repeat:
+		dataset = dataset.repeat()
+	dataset = dataset.batch(args.batch_size)
+	if mirror:
+		dataset = dataset.map(
+			lambda batch: (batch, tf.random.uniform(tf.shape(batch)) < 0.5)
+		)
+	else:
+		dataset = dataset.map(
+			lambda batch: (batch, tf.zeros_like(batch, dtype=tf.bool))
+		)
+
+	def load(batch_indices, mirror_flags):
+		features, batch_targets = tf.numpy_function(
+			fetch, [batch_indices, mirror_flags], (tf.float32, tf.float32)
+		)
+		features.set_shape((None, PERSPECTIVE_V2_FEATURE_SIZE))
+		batch_targets.set_shape((None, 1))
+		return features, batch_targets
+
+	return dataset.map(load, num_parallel_calls=tf.data.AUTOTUNE)
+
+
+def make_cached_train_dataset(args, cache, train_indices, extra_caches):
+	sources = []
+	weights = []
+
+	def add_source(dataset, example_count):
+		sources.append(dataset)
+		weights.append(float(example_count))
+
+	def seed_for(value):
+		return int(hash_fraction(args.split_seed, value) * (2**31 - 1))
+
+	add_source(
+		make_cached_dataset(
+			cache=cache,
+			indices=train_indices,
+			args=args,
+			shuffle=args.shuffle_buffer > 0,
+			repeat=True,
+			mirror=args.mirror_augmentation,
+			seed=seed_for("shuffle:primary"),
+		),
+		example_count=len(train_indices),
+	)
+	for source_index, (extra_cache, extra_indices) in enumerate(extra_caches):
+		add_source(
+			make_cached_dataset(
+				cache=extra_cache,
+				indices=extra_indices,
+				args=args,
+				shuffle=args.shuffle_buffer > 0,
+				repeat=True,
+				mirror=args.mirror_augmentation,
+				seed=seed_for(f"shuffle:extra:{source_index}"),
+			),
+			example_count=len(extra_indices),
+		)
+
+	if len(sources) == 1:
+		dataset = sources[0]
+	else:
+		# Sources are already batched, so mixing happens per batch here
+		# rather than per example as on the CSV path.
+		weight_total = sum(weights)
+		dataset = tf.data.Dataset.sample_from_datasets(
+			sources,
+			weights=[weight / weight_total for weight in weights],
+			seed=seed_for("source-mix"),
+		)
+	return dataset.prefetch(tf.data.AUTOTUNE)
 
 
 def capped_steps(row_count, batch_size, requested_steps):
@@ -1170,7 +1477,7 @@ def can_use_default_split_counts(args):
 		not args.scan_data
 		and args.max_rows is None
 		and args.data_file.resolve() == DEFAULT_DATA_FILE.resolve()
-		and args.sample_size == DEFAULT_SAMPLE_SIZE
+		and args.sample_size in DEFAULT_SPLIT_COUNTS_BY_SAMPLE
 	)
 
 
@@ -1309,6 +1616,82 @@ def evaluate_validation_buckets(model, args, raw_rows, sample_fraction, steps):
 	return finalize_bucket_metrics(buckets)
 
 
+def evaluate_validation_buckets_cached(model, cache, indices, args, steps):
+	"""Bucketed validation MAE from cached rows.
+
+	Mate rows are not distinguishable from other clipped rows in the cache,
+	so only the clipped bucket is reported.
+	"""
+	if steps == 0 or len(indices) == 0:
+		return {}
+
+	buckets = {
+		"abs_eval_lt_1": empty_bucket_metric(),
+		"abs_eval_1_to_3": empty_bucket_metric(),
+		"abs_eval_3_to_6": empty_bucket_metric(),
+		"abs_eval_gt_6": empty_bucket_metric(),
+		"clipped": empty_bucket_metric(),
+	}
+	clip = min(args.max_abs_pawns, cache.max_abs_pawns)
+	max_examples = min(len(indices), steps * args.batch_size)
+	for start in range(0, max_examples, args.batch_size):
+		batch_indices = indices[start:start + args.batch_size]
+		features = unpack_features(
+			cache.boards[batch_indices], cache.metadata[batch_indices]
+		)
+		targets = cache.targets[batch_indices].astype(np.float32)
+		targets = np.clip(targets, -clip, clip)
+		predictions = np.asarray(model.predict_on_batch(features)).reshape(-1)
+		for prediction, target in zip(predictions, targets):
+			error = abs(float(prediction) - float(target))
+			add_bucket_error(buckets, target_bucket_name(float(target)), error)
+			if abs(float(target)) >= clip:
+				add_bucket_error(buckets, "clipped", error)
+	return finalize_bucket_metrics(buckets)
+
+
+def make_generator_train_eval_dataset(args, raw_rows, sample_fraction):
+	"""Materialize a fixed train-split subsample for inference-mode MAE.
+
+	The CSV path has no random access, so the first examples of the training
+	split are encoded once up front and kept in memory as float16.
+	"""
+	count = args.train_split_eval_examples
+	if count == 0:
+		return None
+	feature_size = feature_size_for_architecture(args.architecture)
+	features = np.empty((count, feature_size), dtype=np.float16)
+	targets = np.empty((count, 1), dtype=np.float32)
+	collected = 0
+	for example_features, example_target in iter_examples(
+		path=args.data_file,
+		raw_rows=raw_rows,
+		split="train",
+		sample_fraction=sample_fraction,
+		sample_seed=args.sample_seed,
+		split_seed=args.split_seed,
+		max_abs_pawns=args.max_abs_pawns,
+		architecture=args.architecture,
+	):
+		features[collected] = example_features
+		targets[collected] = example_target
+		collected += 1
+		if collected >= count:
+			break
+	if collected == 0:
+		return None
+	features = features[:collected]
+	targets = targets[:collected]
+	dataset = tf.data.Dataset.from_tensor_slices((features, targets))
+	dataset = dataset.batch(args.batch_size)
+	return dataset.map(
+		lambda batch_features, batch_targets: (
+			tf.cast(batch_features, tf.float32),
+			batch_targets,
+		)
+	).prefetch(tf.data.AUTOTUNE)
+
+
 def write_training_report(
 	args,
 	split_counts,
@@ -1317,11 +1700,19 @@ def write_training_report(
 	test_results,
 	validation_bucket_metrics,
 	model_params,
+	train_split_results=None,
 ):
 	report = {
 		"architecture": args.architecture,
 		"data_file": str(args.data_file),
+		"encoded_cache_dir": (
+			str(args.encoded_cache_dir)
+			if args.encoded_cache_dir is not None
+			else None
+		),
 		"extra_data_files": [str(path) for path in args.extra_data_file],
+		"extra_cache_dirs": [str(path) for path in args.extra_cache_dir],
+		"train_split_eval_examples": int(args.train_split_eval_examples),
 		"sample_size": args.sample_size,
 		"split_counts": {name: int(value) for name, value in split_counts.items()},
 		"extra_train_rows": {
@@ -1337,8 +1728,10 @@ def write_training_report(
 		"optimizer": optimizer_description(args),
 		"batch_size": int(args.batch_size),
 		"mixed_precision": args.mixed_precision_policy,
+		"gradient_clipnorm": float(args.gradient_clipnorm),
 		"mirror_augmentation": bool(args.mirror_augmentation),
 		"epochs_requested": int(args.epochs),
+		"initial_epoch": int(args.initial_epoch),
 		"steps_per_epoch": int(args.train_steps_per_epoch),
 		"total_train_steps": int(args.total_train_steps),
 		"target_mae": float(args.target_mae),
@@ -1349,6 +1742,11 @@ def write_training_report(
 		"model_params": int(model_params),
 		"best_epoch": best_epoch_report(history),
 		"final_epoch": final_epoch_report(history),
+		"best_weights_train_split_metrics": (
+			{name: float(value) for name, value in train_split_results.items()}
+			if train_split_results
+			else None
+		),
 		"test_metrics": {
 			name: float(value) for name, value in test_results.items()
 		},
@@ -1366,17 +1764,116 @@ def write_training_report(
 		file.write("\n")
 
 
-def main():
-	args = parse_args()
-	validate_args(args)
-	configure_tensorflow(args)
+def prepare_cached_data(args):
+	"""Datasets served from a pre-encoded on-disk cache (fast path)."""
+	cache = EncodedCache(args.encoded_cache_dir)
+	if cache.train_only:
+		raise ValueError(
+			"the primary encoded cache must contain train/validation/test "
+			"splits; it was built with --train-only"
+		)
+	if args.split_seed != cache.split_seed:
+		raise ValueError(
+			f"cache split seed {cache.split_seed!r} does not match "
+			f"--split-seed {args.split_seed!r}"
+		)
+	if args.max_abs_pawns > cache.max_abs_pawns:
+		raise ValueError(
+			f"cache targets are clipped to +/-{cache.max_abs_pawns:g} pawns; "
+			f"--max-abs-pawns {args.max_abs_pawns:g} needs a rebuilt cache"
+		)
+	if args.sample_size > 0 and args.sample_seed != cache.sample_seed:
+		raise ValueError(
+			f"cache sample seed {cache.sample_seed!r} does not match "
+			f"--sample-seed {args.sample_seed!r}"
+		)
 
-	print("Preparing depth-8 position evaluator training.", flush=True)
+	sample_fraction = sample_fraction_for(cache.rows, args.sample_size)
+	train_indices = cache.split_indices("train", sample_fraction)
+	validation_indices = cache.split_indices("validation", sample_fraction)
+	test_indices = cache.split_indices("test", sample_fraction)
+	if len(train_indices) == 0:
+		raise ValueError("deterministic sample contains no training rows")
+	split_counts = {
+		"train": len(train_indices),
+		"validation": len(validation_indices),
+		"test": len(test_indices),
+	}
+
+	extra_caches = []
+	extra_row_counts = {}
+	for path in args.extra_cache_dir:
+		extra_cache = EncodedCache(path)
+		if args.max_abs_pawns > extra_cache.max_abs_pawns:
+			raise ValueError(
+				f"extra cache {path} is clipped to "
+				f"+/-{extra_cache.max_abs_pawns:g} pawns"
+			)
+		extra_indices = extra_cache.split_indices("train")
+		extra_caches.append((extra_cache, extra_indices))
+		extra_row_counts[path] = len(extra_indices)
+
+	examples_per_epoch = len(train_indices) + sum(
+		len(extra_indices) for _, extra_indices in extra_caches
+	)
+
+	validation_dataset = None
+	if len(validation_indices) > 0:
+		validation_dataset = make_cached_dataset(
+			cache, validation_indices, args
+		).prefetch(tf.data.AUTOTUNE)
+	test_dataset = None
+	if len(test_indices) > 0:
+		test_dataset = make_cached_dataset(
+			cache, test_indices, args
+		).prefetch(tf.data.AUTOTUNE)
+
+	train_eval_dataset = None
+	if args.train_split_eval_examples > 0:
+		rng = np.random.default_rng(
+			int(hash_fraction(args.split_seed, "train-split-eval") * (2**31 - 1))
+		)
+		eval_count = min(args.train_split_eval_examples, len(train_indices))
+		eval_indices = np.sort(
+			rng.choice(train_indices, size=eval_count, replace=False)
+		)
+		train_eval_dataset = make_cached_dataset(
+			cache, eval_indices, args
+		).prefetch(tf.data.AUTOTUNE)
+
+	def bucket_evaluator(model, steps):
+		return evaluate_validation_buckets_cached(
+			model=model,
+			cache=cache,
+			indices=validation_indices,
+			args=args,
+			steps=steps,
+		)
+
+	print(f"Encoded cache: {args.encoded_cache_dir} ({cache.rows} rows)")
+	return SimpleNamespace(
+		raw_rows=cache.rows,
+		sample_fraction=sample_fraction,
+		split_counts=split_counts,
+		extra_row_counts=extra_row_counts,
+		examples_per_epoch=examples_per_epoch,
+		train_dataset=make_cached_train_dataset(
+			args, cache, train_indices, extra_caches
+		),
+		validation_dataset=validation_dataset,
+		test_dataset=test_dataset,
+		train_eval_dataset=train_eval_dataset,
+		bucket_evaluator=bucket_evaluator,
+	)
+
+
+def prepare_generator_data(args):
+	"""Datasets streamed from the CSV with per-example Python encoding."""
 	if can_use_default_split_counts(args):
 		print("Using known default source and split counts.", flush=True)
 		raw_rows = DEFAULT_SOURCE_ROWS
 		sample_fraction = sample_fraction_for(raw_rows, args.sample_size)
-		split_counts = dict(DEFAULT_SPLIT_COUNTS)
+		split_counts = dict(DEFAULT_SPLIT_COUNTS_BY_SAMPLE[args.sample_size])
 	else:
 		print("Counting source rows...", flush=True)
 		raw_rows = count_source_rows(args.data_file, args.max_rows)
@@ -1401,6 +1898,72 @@ def main():
 		extra_row_counts=extra_row_counts,
 		mirror_augmentation=args.mirror_augmentation,
 	)
+	args.primary_train_rows = split_counts["train"]
+
+	validation_dataset = None
+	if split_counts["validation"] > 0:
+		validation_dataset = make_dataset(
+			args, raw_rows, "validation", sample_fraction
+		)
+	test_dataset = None
+	if split_counts["test"] > 0:
+		test_dataset = make_dataset(args, raw_rows, "test", sample_fraction)
+
+	train_eval_dataset = None
+	if args.train_split_eval_examples > 0 and not args.dry_run:
+		print(
+			f"Encoding {args.train_split_eval_examples} train-split rows "
+			"for per-epoch evaluation...",
+			flush=True,
+		)
+		train_eval_dataset = make_generator_train_eval_dataset(
+			args, raw_rows, sample_fraction
+		)
+
+	def bucket_evaluator(model, steps):
+		return evaluate_validation_buckets(
+			model=model,
+			args=args,
+			raw_rows=raw_rows,
+			sample_fraction=sample_fraction,
+			steps=steps,
+		)
+
+	return SimpleNamespace(
+		raw_rows=raw_rows,
+		sample_fraction=sample_fraction,
+		split_counts=split_counts,
+		extra_row_counts=extra_row_counts,
+		examples_per_epoch=examples_per_epoch,
+		train_dataset=make_train_dataset(
+			args,
+			raw_rows,
+			sample_fraction,
+			extra_row_counts=extra_row_counts,
+		),
+		validation_dataset=validation_dataset,
+		test_dataset=test_dataset,
+		train_eval_dataset=train_eval_dataset,
+		bucket_evaluator=bucket_evaluator,
+	)
+
+
+def main():
+	args = parse_args()
+	validate_args(args)
+	configure_tensorflow(args)
+
+	print("Preparing depth-8 position evaluator training.", flush=True)
+	if args.encoded_cache_dir is not None:
+		data = prepare_cached_data(args)
+	else:
+		data = prepare_generator_data(args)
+	raw_rows = data.raw_rows
+	sample_fraction = data.sample_fraction
+	split_counts = data.split_counts
+	extra_row_counts = data.extra_row_counts
+	examples_per_epoch = data.examples_per_epoch
+
 	steps_per_epoch = capped_steps(
 		examples_per_epoch, args.batch_size, args.steps_per_epoch
 	)
@@ -1412,6 +1975,7 @@ def main():
 	)
 	args.train_steps_per_epoch = steps_per_epoch
 	args.total_train_steps = steps_per_epoch * args.epochs
+	args.lr_schedule_step_offset = steps_per_epoch * args.initial_epoch
 
 	print("Experiment: depth-8 position evaluator with pawn-scale MAE")
 	print(f"Data file: {args.data_file}")
@@ -1419,6 +1983,8 @@ def main():
 		print("Extra data policy: train-only")
 		for path in args.extra_data_file:
 			print(f"Extra data file: {path}")
+	for path in args.extra_cache_dir:
+		print(f"Extra cache: {path}")
 	print(f"Architecture: {args.architecture}")
 	if args.architecture != ARCHITECTURE_PAPER_MLP:
 		print(
@@ -1455,8 +2021,13 @@ def main():
 	print(f"Optimizer: {optimizer_description(args)}")
 	print(f"Batch size: {args.batch_size}")
 	print(f"Mixed precision: {args.mixed_precision_policy}")
+	if args.train_split_eval_examples > 0:
+		print(
+			"Train-split eval: "
+			f"{args.train_split_eval_examples} fixed rows, inference mode"
+		)
 	if args.target_mae > 0:
-		print(f"Target stop: train mae and val_mae <= {args.target_mae:g}")
+		print(f"Target stop: train and validation MAE <= {args.target_mae:g}")
 	if args.early_stopping_patience > 0:
 		print(
 			"Early stopping: "
@@ -1473,27 +2044,24 @@ def main():
 	print(f"Weights checkpoint: {args.weights_out}")
 	if args.initial_weights is not None:
 		print(f"Initial weights: {args.initial_weights}")
+	if args.initial_epoch > 0:
+		print(
+			f"Resuming at epoch {args.initial_epoch + 1}/{args.epochs} "
+			f"(LR schedule step offset {args.lr_schedule_step_offset})"
+		)
+		if args.initial_epoch >= args.epochs:
+			print(
+				"All requested epochs are already in the history CSV; "
+				"skipping training and running final evaluation only."
+			)
 	print(f"Training report: {args.report_out}")
 	print(f"Training log: {args.log_out}")
 	if validation_steps == 0:
 		print("Validation is disabled because this split has no rows.")
 
-	train_dataset = make_dataset(
-		args,
-		raw_rows,
-		"train",
-		sample_fraction,
-		repeat=True,
-		extra_row_counts=extra_row_counts,
-	)
-	validation_dataset = None
-	if validation_steps > 0:
-		validation_dataset = make_dataset(
-			args, raw_rows, "validation", sample_fraction
-		)
-	test_dataset = None
-	if test_steps > 0:
-		test_dataset = make_dataset(args, raw_rows, "test", sample_fraction)
+	train_dataset = data.train_dataset
+	validation_dataset = data.validation_dataset if validation_steps > 0 else None
+	test_dataset = data.test_dataset if test_steps > 0 else None
 
 	model = build_model(args)
 	if args.initial_weights is not None:
@@ -1515,15 +2083,33 @@ def main():
 
 	checkpoint_monitor = "val_mae" if validation_steps > 0 else "mae"
 
+	# On resume, seed the checkpoint's best-so-far from the history CSV so a
+	# worse first resumed epoch cannot overwrite the better saved weights.
+	checkpoint_kwargs = {}
+	if args.initial_epoch > 0:
+		prior_best = best_metric_from_history(args.log_out, checkpoint_monitor)
+		if prior_best is not None and "initial_value_threshold" in inspect.signature(
+			tf.keras.callbacks.ModelCheckpoint.__init__
+		).parameters:
+			checkpoint_kwargs["initial_value_threshold"] = prior_best
+
 	callbacks = [
+		tf.keras.callbacks.TerminateOnNaN(),
+	]
+	if data.train_eval_dataset is not None:
+		callbacks.append(TrainSplitMae(data.train_eval_dataset))
+	callbacks += [
 		tf.keras.callbacks.ModelCheckpoint(
 			filepath=str(args.weights_out),
 			monitor=checkpoint_monitor,
 			mode="min",
 			save_best_only=True,
 			save_weights_only=True,
+			**checkpoint_kwargs,
 		),
-		tf.keras.callbacks.CSVLogger(str(args.log_out)),
+		tf.keras.callbacks.CSVLogger(
+			str(args.log_out), append=args.initial_epoch > 0
+		),
 	]
 	if args.early_stopping_patience > 0:
 		callbacks.append(
@@ -1546,6 +2132,7 @@ def main():
 	fit_kwargs = {
 		"x": train_dataset,
 		"epochs": args.epochs,
+		"initial_epoch": args.initial_epoch,
 		"steps_per_epoch": steps_per_epoch,
 		"callbacks": callbacks,
 	}
@@ -1565,13 +2152,14 @@ def main():
 		)
 	else:
 		results = {}
-	validation_bucket_metrics = evaluate_validation_buckets(
-		model=model,
-		args=args,
-		raw_rows=raw_rows,
-		sample_fraction=sample_fraction,
-		steps=validation_steps,
-	)
+	train_split_results = None
+	if data.train_eval_dataset is not None:
+		train_split_results = model.evaluate(
+			data.train_eval_dataset,
+			verbose=0,
+			return_dict=True,
+		)
+	validation_bucket_metrics = data.bucket_evaluator(model, validation_steps)
 	write_training_report(
 		args=args,
 		split_counts=split_counts,
@@ -1580,10 +2168,19 @@ def main():
 		test_results=results,
 		validation_bucket_metrics=validation_bucket_metrics,
 		model_params=model.count_params(),
+		train_split_results=train_split_results,
 	)
 	print(f"Saved best evaluator model to {args.model_out}")
 	print(f"Saved best weights to {args.weights_out}")
 	print(f"Wrote training report to {args.report_out}")
+	if train_split_results:
+		print(
+			"Best-weights train-split metrics: "
+			+ ", ".join(
+				f"{name}={value:.6f}"
+				for name, value in train_split_results.items()
+			)
+		)
 	print(
 		"Test metrics: "
 		+ ", ".join(f"{name}={value:.6f}" for name, value in results.items())
