@@ -4,15 +4,13 @@ Encoding FENs in Python is the training bottleneck, so this runs once,
 in parallel, and training then streams the packed rows from memmaps.
 
 Usage:
-  python core/ai/encode_dataset.py                      # depth8 dataset
-  python core/ai/encode_dataset.py --data-file data/tactic_evals.csv \
-      --out-dir data/encoded/tactic_evals_perspective_v2 --train-only
+  python core/ai/encode_dataset.py
+  python core/ai/encode_dataset.py --data-file data/extra.csv --train-only
 """
 
 import argparse
 import csv
 import multiprocessing
-import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,16 +18,15 @@ from pathlib import Path
 import numpy as np
 
 from board_features import (
-	encode_fen_perspective_v2,
-	evaluation_to_paper_pawns,
+	encode_fen_perspective_v3,
+	evaluation_to_pawns,
 	hash_fraction,
 	position_key,
 	split_for_fen,
 )
 from encoded_cache import (
-	CACHE_ARCHITECTURE,
-	FEATURE_SIZE,
-	MIRROR_PERMUTATION,
+	CACHE_ARCHITECTURE_V3,
+	CACHE_SPECS,
 	CacheWriter,
 	SPLIT_CODES,
 	pack_features,
@@ -42,20 +39,21 @@ DEFAULT_DATA_FILE = ROOT_DIR / "data" / "chessData_depth8.csv"
 DEFAULT_SPLIT_SEED = "sabatelli-dataset4-split-v1"
 DEFAULT_SAMPLE_SEED = "sabatelli-dataset4-sample-v1"
 DEFAULT_MAX_ABS_PAWNS = 10.0
+CACHE_DIR_SUFFIX = "perspective_v3"
 
 _WORKER_CONFIG = None
 
 
 def parse_args():
 	parser = argparse.ArgumentParser(
-		description=f"Pre-encode positions for the {CACHE_ARCHITECTURE} trainer."
+		description="Pre-encode positions for the perspective-transformer-v3 trainer."
 	)
 	parser.add_argument("--data-file", type=Path, default=DEFAULT_DATA_FILE)
 	parser.add_argument(
 		"--out-dir",
 		type=Path,
 		default=None,
-		help="Cache directory. Defaults to data/encoded/<csv stem>_perspective_v2.",
+		help="Cache directory. Defaults to data/encoded/<csv stem>_perspective_v3.",
 	)
 	parser.add_argument(
 		"--workers",
@@ -86,7 +84,8 @@ def parse_args():
 	args = parser.parse_args()
 	if args.out_dir is None:
 		args.out_dir = (
-			ROOT_DIR / "data" / "encoded" / f"{args.data_file.stem}_perspective_v2"
+			ROOT_DIR / "data" / "encoded"
+			/ f"{args.data_file.stem}_{CACHE_DIR_SUFFIX}"
 		)
 	if args.workers < 1:
 		raise ValueError("--workers must be positive")
@@ -143,14 +142,16 @@ def init_worker(config):
 def encode_chunk(chunk):
 	config = _WORKER_CONFIG
 	count = len(chunk)
-	features = np.empty((count, FEATURE_SIZE), dtype=np.float32)
+	features = np.empty(
+		(count, CACHE_SPECS[CACHE_ARCHITECTURE_V3].feature_size), dtype=np.float32
+	)
 	targets = np.empty(count, dtype=np.float32)
 	splits = np.zeros(count, dtype=np.uint8)
 	sample = np.empty(count, dtype=np.float32)
 
 	for index, (fen, evaluation) in enumerate(chunk):
-		features[index] = encode_fen_perspective_v2(fen)
-		targets[index] = evaluation_to_paper_pawns(
+		features[index] = encode_fen_perspective_v3(fen)
+		targets[index] = evaluation_to_pawns(
 			evaluation, max_abs_pawns=config["max_abs_pawns"]
 		)
 		key = position_key(fen)
@@ -163,7 +164,7 @@ def encode_chunk(chunk):
 
 
 def verify_encoding(path, max_rows, verify_rows):
-	"""Check pack/unpack and the mirror permutation against direct encoding."""
+	mirror_permutation = CACHE_SPECS[CACHE_ARCHITECTURE_V3].mirror_permutation
 	file, reader, fen_index, _ = open_csv_columns(path)
 	with file:
 		checked = 0
@@ -171,13 +172,13 @@ def verify_encoding(path, max_rows, verify_rows):
 			if checked >= verify_rows or (max_rows is not None and checked >= max_rows):
 				break
 			fen = row[fen_index]
-			direct = encode_fen_perspective_v2(fen)
+			direct = encode_fen_perspective_v3(fen)
 			boards, metadata = pack_features(direct[np.newaxis, :])
 			round_trip = unpack_features(boards, metadata)[0]
 			if not np.allclose(direct, round_trip, atol=0.01):
 				raise AssertionError(f"pack/unpack mismatch for FEN: {fen}")
-			mirrored_direct = encode_fen_perspective_v2(fen, mirror_files=True)
-			mirrored_cached = round_trip[MIRROR_PERMUTATION]
+			mirrored_direct = encode_fen_perspective_v3(fen, mirror_files=True)
+			mirrored_cached = round_trip[mirror_permutation]
 			if not np.allclose(mirrored_direct, mirrored_cached, atol=0.01):
 				raise AssertionError(f"mirror permutation mismatch for FEN: {fen}")
 			checked += 1

@@ -1,7 +1,6 @@
-"""Pure-Python position encoding and dataset split helpers.
+"""Perspective-v3 position encoding and dataset split helpers.
 
-This module intentionally avoids importing TensorFlow so that dataset
-pre-encoding workers can import it cheaply in parallel processes.
+Must stay TensorFlow-free: dataset encoder worker processes import it.
 """
 
 import hashlib
@@ -24,23 +23,20 @@ PIECE_PLANES = {
 	"q": 10,
 	"k": 11,
 }
-METADATA_SIZE = 7
 PIECE_PLANE_COUNT = len(PIECE_PLANES)
 ATTACK_PLANE_COUNT = len(PIECE_PLANES)
-BOARD_FEATURE_SIZE = BOARD_SIZE * BOARD_SIZE * PIECE_PLANE_COUNT
-PAPER_BITMAP_FEATURE_SIZE = BOARD_FEATURE_SIZE
-PAPER_MAX_ABS_CENTIPAWNS = 5000
-PAPER_PAWN_TARGET_LIMIT = 10.0
-ATTACK_BOARD_FEATURE_SIZE = BOARD_SIZE * BOARD_SIZE * (
-	PIECE_PLANE_COUNT + ATTACK_PLANE_COUNT
+TACTICAL_PLANE_COUNT = 4
+PERSPECTIVE_V3_PLANE_COUNT = (
+	PIECE_PLANE_COUNT + ATTACK_PLANE_COUNT + TACTICAL_PLANE_COUNT
 )
-FEATURE_SIZE = BOARD_FEATURE_SIZE + METADATA_SIZE
-ATTACK_FEATURE_SIZE = ATTACK_BOARD_FEATURE_SIZE + METADATA_SIZE
+PERSPECTIVE_V3_BOARD_FEATURE_SIZE = (
+	BOARD_SIZE * BOARD_SIZE * PERSPECTIVE_V3_PLANE_COUNT
+)
 PERSPECTIVE_METADATA_SIZE = 6
-PERSPECTIVE_FEATURE_SIZE = ATTACK_BOARD_FEATURE_SIZE + PERSPECTIVE_METADATA_SIZE
 PERSPECTIVE_V2_METADATA_SIZE = 24
-PERSPECTIVE_V2_FEATURE_SIZE = (
-	ATTACK_BOARD_FEATURE_SIZE + PERSPECTIVE_V2_METADATA_SIZE
+PERSPECTIVE_V3_METADATA_SIZE = PERSPECTIVE_V2_METADATA_SIZE + 8
+PERSPECTIVE_V3_FEATURE_SIZE = (
+	PERSPECTIVE_V3_BOARD_FEATURE_SIZE + PERSPECTIVE_V3_METADATA_SIZE
 )
 RELATIVE_PIECE_PLANES = {
 	"p": 0,
@@ -71,7 +67,6 @@ MAX_TOTAL_PHASE = 24.0
 
 
 def evaluation_to_pawns(evaluation, max_abs_pawns=10.0):
-	"""Convert repo evaluation strings to a clipped side-to-move pawn score."""
 	value = str(evaluation).strip()
 	if not value:
 		raise ValueError("empty evaluation")
@@ -86,56 +81,35 @@ def evaluation_to_pawns(evaluation, max_abs_pawns=10.0):
 	return float(np.clip(score, -max_abs_pawns, max_abs_pawns))
 
 
-def evaluation_to_paper_target(
-	evaluation, max_abs_centipawns=PAPER_MAX_ABS_CENTIPAWNS
-):
-	"""Map a side-to-move Stockfish score to the paper's [0, 1] target range."""
-	value = str(evaluation).strip()
-	if not value:
-		raise ValueError("empty evaluation")
-
-	if value.startswith("#"):
-		if len(value) < 2 or value[1] not in "+-":
-			raise ValueError(f"invalid mate evaluation: {value}")
-		centipawns = max_abs_centipawns if value[1] == "+" else -max_abs_centipawns
-	else:
-		centipawns = int(value)
-
-	centipawns = np.clip(
-		centipawns, -max_abs_centipawns, max_abs_centipawns
-	)
-	return float(
-		(centipawns + max_abs_centipawns) / (2.0 * max_abs_centipawns)
-	)
-
-
-def evaluation_to_paper_pawns(
-	evaluation, max_abs_pawns=PAPER_PAWN_TARGET_LIMIT
-):
-	"""Convert a Stockfish score to a clipped pawn value for the paper bitmap MLP."""
-	return evaluation_to_pawns(evaluation, max_abs_pawns=max_abs_pawns)
-
-
-def paper_target_to_pawns(
-	target, max_abs_centipawns=PAPER_MAX_ABS_CENTIPAWNS
-):
-	"""Convert the paper MLP's [0, 1] output back to side-to-move pawns."""
-	centipawns = (
-		float(target) * (2.0 * max_abs_centipawns) - max_abs_centipawns
-	)
-	return centipawns / 100.0
-
-
 def position_key(fen):
-	"""Board, side to move, castling and en passant fields of a FEN."""
 	fields = str(fen).strip().split()
 	if len(fields) < 4:
 		raise ValueError(f"invalid FEN: {fen}")
 	return " ".join(fields[:4])
 
 
+def board_position_key(board):
+	"""Hashable identity of a Board position for caching and repetition.
+
+	Placement symbols + side to move + castling rights fully determine
+	both the evaluator features and the legal moves: pawn hasMoved is
+	derivable from the rank and there is no en passant.
+	"""
+	chars = []
+	for row in board.pieces:
+		for piece in row:
+			chars.append("." if piece is None else piece.symbol)
+	return (
+		"".join(chars),
+		board.turn,
+		board.has_kingside_castling_rights(1),
+		board.has_queenside_castling_rights(1),
+		board.has_kingside_castling_rights(0),
+		board.has_queenside_castling_rights(0),
+	)
+
+
 def hash_fraction(seed, value):
-	"""Deterministic uniform-[0, 1) hash used for sampling and splitting."""
 	digest = hashlib.blake2b(
 		f"{seed}\0{value}".encode("utf-8"), digest_size=8
 	).digest()
@@ -143,7 +117,6 @@ def hash_fraction(seed, value):
 
 
 def split_for_fen(fen, split_seed):
-	"""Deterministic 80/10/10 train/validation/test split for a position."""
 	value = hash_fraction(split_seed, position_key(fen))
 	if value < 0.8:
 		return "train"
@@ -158,69 +131,7 @@ def selected_for_sample(fen, sample_fraction, sample_seed):
 	return hash_fraction(sample_seed, position_key(fen)) < sample_fraction
 
 
-def encode_fen_paper_bitmap(fen):
-	"""Encode a FEN as the paper's 768-value, 12-plane bitmap input."""
-	fields = str(fen).strip().split()
-	if len(fields) < 1:
-		raise ValueError(f"invalid FEN: {fen}")
-
-	board_symbols = _symbols_from_fen_board(fields[0])
-	return _paper_bitmap_from_symbols(board_symbols)
-
-
-def encode_board_paper_bitmap(board):
-	"""Encode a live board with the same bitmap schema used for paper training."""
-	board_symbols = [[None for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
-	for row in board.pieces:
-		for piece in row:
-			if piece is not None:
-				board_symbols[piece.y][piece.x] = piece.symbol
-	return _paper_bitmap_from_symbols(board_symbols)
-
-
-def encode_fen(fen, include_attack_maps=False):
-	"""Encode a FEN string for either the base or attack-map evaluator."""
-	fields = str(fen).strip().split()
-	if len(fields) < 4:
-		raise ValueError(f"invalid FEN: {fen}")
-
-	board_part, turn, castling = fields[0], fields[1], fields[2]
-	if turn not in ("w", "b"):
-		raise ValueError(f"invalid FEN turn field: {turn}")
-
-	board_symbols = _symbols_from_fen_board(board_part)
-	return _encode_symbols(
-		board_symbols=board_symbols,
-		white_to_move=(turn == "w"),
-		castling_rights={
-			"K": "K" in castling,
-			"Q": "Q" in castling,
-			"k": "k" in castling,
-			"q": "q" in castling,
-		},
-		include_attack_maps=include_attack_maps,
-	)
-
-
-def encode_board(board, include_attack_maps=False):
-	"""Encode the project's live Board object with the same schema as encode_fen."""
-	board_symbols = [[None for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
-	for row in board.pieces:
-		for piece in row:
-			if piece is None:
-				continue
-			board_symbols[piece.y][piece.x] = piece.symbol
-
-	return _encode_symbols(
-		board_symbols=board_symbols,
-		white_to_move=_board_white_to_move(board),
-		castling_rights=_board_castling_rights(board),
-		include_attack_maps=include_attack_maps,
-	)
-
-
-def encode_fen_perspective(fen, mirror_files=False):
-	"""Encode a FEN with the side to move represented as the first player."""
+def encode_fen_perspective_v3(fen, mirror_files=False):
 	fields = str(fen).strip().split()
 	if len(fields) < 4:
 		raise ValueError(f"invalid FEN: {fen}")
@@ -242,32 +153,7 @@ def encode_fen_perspective(fen, mirror_files=False):
 	)
 
 
-def encode_fen_perspective_v2(fen, mirror_files=False):
-	"""Encode a side-to-move perspective FEN with extended scalar metadata."""
-	fields = str(fen).strip().split()
-	if len(fields) < 4:
-		raise ValueError(f"invalid FEN: {fen}")
-
-	board_part, turn, castling = fields[0], fields[1], fields[2]
-	if turn not in ("w", "b"):
-		raise ValueError(f"invalid FEN turn field: {turn}")
-
-	return _encode_perspective_symbols(
-		board_symbols=_symbols_from_fen_board(board_part),
-		white_to_move=(turn == "w"),
-		castling_rights={
-			"K": "K" in castling,
-			"Q": "Q" in castling,
-			"k": "k" in castling,
-			"q": "q" in castling,
-		},
-		mirror_files=mirror_files,
-		enhanced_metadata=True,
-	)
-
-
-def encode_board_perspective(board):
-	"""Encode a live board from the side-to-move player's perspective."""
+def encode_board_perspective_v3(board):
 	board_symbols = [[None for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
 	for row in board.pieces:
 		for piece in row:
@@ -279,23 +165,6 @@ def encode_board_perspective(board):
 		white_to_move=_board_white_to_move(board),
 		castling_rights=_board_castling_rights(board),
 		mirror_files=False,
-	)
-
-
-def encode_board_perspective_v2(board):
-	"""Encode a live board with the v2 side-to-move perspective schema."""
-	board_symbols = [[None for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
-	for row in board.pieces:
-		for piece in row:
-			if piece is not None:
-				board_symbols[piece.y][piece.x] = piece.symbol
-
-	return _encode_perspective_symbols(
-		board_symbols=board_symbols,
-		white_to_move=_board_white_to_move(board),
-		castling_rights=_board_castling_rights(board),
-		mirror_files=False,
-		enhanced_metadata=True,
 	)
 
 
@@ -322,67 +191,21 @@ def _symbols_from_fen_board(board_part):
 	return board_symbols
 
 
-def _paper_bitmap_from_symbols(board_symbols):
-	planes = np.zeros(
-		(BOARD_SIZE, BOARD_SIZE, PIECE_PLANE_COUNT), dtype=np.float32
-	)
-	for fen_y, row in enumerate(board_symbols):
-		paper_y = BOARD_SIZE - 1 - fen_y
-		for x, symbol in enumerate(row):
-			if symbol is not None:
-				planes[paper_y, x, PIECE_PLANES[symbol]] = 1.0
-	return planes.reshape(PAPER_BITMAP_FEATURE_SIZE)
-
-
-def _encode_symbols(board_symbols, white_to_move, castling_rights, include_attack_maps):
-	plane_count = PIECE_PLANE_COUNT
-	feature_size = FEATURE_SIZE
-	if include_attack_maps:
-		plane_count += ATTACK_PLANE_COUNT
-		feature_size = ATTACK_FEATURE_SIZE
-
-	features = np.zeros(feature_size, dtype=np.float32)
-	board_features = np.zeros((BOARD_SIZE, BOARD_SIZE, plane_count), dtype=np.float32)
-
-	for y, row in enumerate(board_symbols):
-		for x, symbol in enumerate(row):
-			if symbol is None:
-				continue
-			board_features[y, x, PIECE_PLANES[symbol]] = 1.0
-			if include_attack_maps:
-				attack_plane = PIECE_PLANE_COUNT + PIECE_PLANES[symbol]
-				for attack_y, attack_x in _piece_attack_squares(
-					board_symbols, y, x, symbol
-				):
-					board_features[attack_y, attack_x, attack_plane] = 1.0
-
-	board_feature_size = BOARD_SIZE * BOARD_SIZE * plane_count
-	features[:board_feature_size] = board_features.reshape(-1)
-	features[board_feature_size] = 1.0 if white_to_move else 0.0
-	features[board_feature_size + 1] = (
-		1.0 if white_to_move and _king_in_check(board_symbols, True) else 0.0
-	)
-	features[board_feature_size + 2] = (
-		1.0 if (not white_to_move) and _king_in_check(board_symbols, False) else 0.0
-	)
-	features[board_feature_size + 3] = 1.0 if castling_rights.get("K", False) else 0.0
-	features[board_feature_size + 4] = 1.0 if castling_rights.get("Q", False) else 0.0
-	features[board_feature_size + 5] = 1.0 if castling_rights.get("k", False) else 0.0
-	features[board_feature_size + 6] = 1.0 if castling_rights.get("q", False) else 0.0
-	return features
-
-
 def _encode_perspective_symbols(
 	board_symbols,
 	white_to_move,
 	castling_rights,
 	mirror_files,
-	enhanced_metadata=False,
 ):
 	board_features = np.zeros(
-		(BOARD_SIZE, BOARD_SIZE, PIECE_PLANE_COUNT + ATTACK_PLANE_COUNT),
-		dtype=np.float32,
+		(BOARD_SIZE, BOARD_SIZE, PERSPECTIVE_V3_PLANE_COUNT), dtype=np.float32
 	)
+	# Attacker counts accumulate in feature coordinates so the derived
+	# tactical planes mirror exactly like every other plane.
+	own_attack_counts = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int32)
+	opponent_attack_counts = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int32)
+	own_squares = []
+	opponent_squares = []
 
 	for y, row in enumerate(board_symbols):
 		for x, symbol in enumerate(row):
@@ -390,11 +213,17 @@ def _encode_perspective_symbols(
 				continue
 
 			piece_is_white = symbol.isupper()
-			player_offset = 0 if piece_is_white == white_to_move else 6
+			piece_is_own = piece_is_white == white_to_move
+			player_offset = 0 if piece_is_own else 6
 			piece_plane = player_offset + RELATIVE_PIECE_PLANES[symbol.lower()]
 			feature_y = y if white_to_move else BOARD_SIZE - 1 - y
 			feature_x = BOARD_SIZE - 1 - x if mirror_files else x
 			board_features[feature_y, feature_x, piece_plane] = 1.0
+			squares = own_squares if piece_is_own else opponent_squares
+			squares.append((feature_y, feature_x, symbol.lower()))
+			attack_counts = (
+				own_attack_counts if piece_is_own else opponent_attack_counts
+			)
 
 			attack_plane = PIECE_PLANE_COUNT + piece_plane
 			for attack_y, attack_x in _piece_attack_squares(
@@ -409,15 +238,19 @@ def _encode_perspective_symbols(
 				board_features[
 					feature_attack_y, feature_attack_x, attack_plane
 				] = 1.0
+				attack_counts[feature_attack_y, feature_attack_x] += 1
 
-	feature_size = (
-		PERSPECTIVE_V2_FEATURE_SIZE
-		if enhanced_metadata
-		else PERSPECTIVE_FEATURE_SIZE
+	tactical_metadata = _apply_tactical_features(
+		board_features=board_features,
+		own_attack_counts=own_attack_counts,
+		opponent_attack_counts=opponent_attack_counts,
+		own_squares=own_squares,
+		opponent_squares=opponent_squares,
 	)
-	features = np.zeros(feature_size, dtype=np.float32)
-	features[:ATTACK_BOARD_FEATURE_SIZE] = board_features.reshape(-1)
-	metadata = features[ATTACK_BOARD_FEATURE_SIZE:]
+
+	features = np.zeros(PERSPECTIVE_V3_FEATURE_SIZE, dtype=np.float32)
+	features[:PERSPECTIVE_V3_BOARD_FEATURE_SIZE] = board_features.reshape(-1)
+	metadata = features[PERSPECTIVE_V3_BOARD_FEATURE_SIZE:]
 	metadata[0] = 1.0 if _king_in_check(board_symbols, white_to_move) else 0.0
 	metadata[1] = 1.0 if _king_in_check(board_symbols, not white_to_move) else 0.0
 
@@ -425,12 +258,86 @@ def _encode_perspective_symbols(
 	for index, key in enumerate(castling_keys, start=2):
 		metadata[index] = 1.0 if castling_rights.get(key, False) else 0.0
 
-	if enhanced_metadata:
-		metadata[PERSPECTIVE_METADATA_SIZE:] = _perspective_extra_metadata(
+	metadata[PERSPECTIVE_METADATA_SIZE:PERSPECTIVE_V2_METADATA_SIZE] = (
+		_perspective_extra_metadata(
 			board_symbols=board_symbols,
 			white_to_move=white_to_move,
 		)
+	)
+	metadata[PERSPECTIVE_V2_METADATA_SIZE:] = tactical_metadata
 	return features
+
+
+def _apply_tactical_features(
+	board_features,
+	own_attack_counts,
+	opponent_attack_counts,
+	own_squares,
+	opponent_squares,
+):
+	"""Fill the four tactical planes; return the eight tactical scalars.
+
+	Hanging = a non-king piece attacked at least once and defended zero
+	times: a static-exchange approximation that ignores pins and attacker
+	values, cheap enough for the dataset encoder.
+	"""
+	base = PIECE_PLANE_COUNT + ATTACK_PLANE_COUNT
+	board_features[:, :, base] = own_attack_counts >= 2
+	board_features[:, :, base + 1] = opponent_attack_counts >= 2
+
+	own_king_square = None
+	opponent_king_square = None
+	own_hanging_count = 0
+	own_hanging_material = 0.0
+	own_attacked_count = 0
+	opponent_hanging_count = 0
+	opponent_hanging_material = 0.0
+	opponent_attacked_count = 0
+
+	for feature_y, feature_x, piece_type in own_squares:
+		if piece_type == "k":
+			own_king_square = (feature_y, feature_x)
+			continue
+		if opponent_attack_counts[feature_y, feature_x] > 0:
+			own_attacked_count += 1
+			if own_attack_counts[feature_y, feature_x] == 0:
+				own_hanging_count += 1
+				own_hanging_material += PIECE_VALUES[piece_type]
+				board_features[feature_y, feature_x, base + 2] = 1.0
+
+	for feature_y, feature_x, piece_type in opponent_squares:
+		if piece_type == "k":
+			opponent_king_square = (feature_y, feature_x)
+			continue
+		if own_attack_counts[feature_y, feature_x] > 0:
+			opponent_attacked_count += 1
+			if opponent_attack_counts[feature_y, feature_x] == 0:
+				opponent_hanging_count += 1
+				opponent_hanging_material += PIECE_VALUES[piece_type]
+				board_features[feature_y, feature_x, base + 3] = 1.0
+
+	return np.array(
+		[
+			own_hanging_count / 8.0,
+			opponent_hanging_count / 8.0,
+			own_hanging_material / MAX_SIDE_MATERIAL,
+			opponent_hanging_material / MAX_SIDE_MATERIAL,
+			_king_zone_attack_count(opponent_attack_counts, own_king_square) / 16.0,
+			_king_zone_attack_count(own_attack_counts, opponent_king_square) / 16.0,
+			own_attacked_count / 16.0,
+			opponent_attacked_count / 16.0,
+		],
+		dtype=np.float32,
+	)
+
+
+def _king_zone_attack_count(attack_counts, king_square):
+	if king_square is None:
+		return 0
+	y, x = king_square
+	y_start, y_stop = max(0, y - 1), min(BOARD_SIZE, y + 2)
+	x_start, x_stop = max(0, x - 1), min(BOARD_SIZE, x + 2)
+	return int(attack_counts[y_start:y_stop, x_start:x_stop].sum())
 
 
 def _perspective_castling_keys(white_to_move, mirror_files):
@@ -441,6 +348,7 @@ def _perspective_castling_keys(white_to_move, mirror_files):
 		own_keys = ("k", "q")
 		opponent_keys = ("K", "Q")
 
+	# Mirroring swaps kingside and queenside.
 	if mirror_files:
 		own_keys = (own_keys[1], own_keys[0])
 		opponent_keys = (opponent_keys[1], opponent_keys[0])
@@ -671,8 +579,7 @@ def _symbol_at(board_symbols, y, x):
 
 
 def _board_white_to_move(board):
-	# Board.turn is initialized to 0 before white's first move and toggled after
-	# every legal move, so 0 means white to move and 1 means black to move.
+	# Board.turn is 0 when white is to move, 1 when black is to move.
 	return board.turn == 0
 
 

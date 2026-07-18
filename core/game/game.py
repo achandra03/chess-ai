@@ -12,22 +12,6 @@ from board import Board
 from engine import Engine
 
 
-DEFAULT_EVALUATOR_WEIGHTS = (
-	AI_DIR / "position_evaluator_perspective_transformer_mae.weights.h5"
-)
-DEFAULT_EVALUATOR_V2_WEIGHTS = (
-	AI_DIR / "position_evaluator_perspective_transformer_v2_mae.weights.h5"
-)
-
-
-def default_evaluator_path():
-	if DEFAULT_EVALUATOR_V2_WEIGHTS.exists():
-		return str(DEFAULT_EVALUATOR_V2_WEIGHTS)
-	if DEFAULT_EVALUATOR_WEIGHTS.exists():
-		return str(DEFAULT_EVALUATOR_WEIGHTS)
-	return None
-
-
 class Game:
 
 	def __init__(self):
@@ -56,7 +40,7 @@ class Game:
 			self.piece_mapping[file] = piece
 
 		self.clickedOn = None
-		model_path = os.environ.get("CHESS_AI_MODEL_PATH") or default_evaluator_path()
+		model_path = os.environ.get("CHESS_AI_MODEL_PATH") or None
 		self.engine = Engine(self.board, model_path=model_path, depth=1)
 
 
@@ -86,7 +70,7 @@ class Game:
 					continue
 				piece = self.board.pieces[i][j]
 				image = self.piece_mapping[piece.filename]
-				self.screen.blit(image, (j * 64 + 5, i * 64 + 5)) #offset to center piece on square
+				self.screen.blit(image, (j * 64 + 5, i * 64 + 5))
 
 
 		pygame.display.flip()

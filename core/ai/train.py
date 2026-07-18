@@ -12,22 +12,14 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 import numpy as np
 import tensorflow as tf
 
-from position_encoding import (
-	ATTACK_BOARD_FEATURE_SIZE,
-	ATTACK_FEATURE_SIZE,
-	PAPER_BITMAP_FEATURE_SIZE,
-	PERSPECTIVE_FEATURE_SIZE,
-	PERSPECTIVE_METADATA_SIZE,
-	PERSPECTIVE_V2_FEATURE_SIZE,
-	PERSPECTIVE_V2_METADATA_SIZE,
-	SquarePositionEmbedding,
-	encode_fen,
-	encode_fen_paper_bitmap,
-	encode_fen_perspective,
-	encode_fen_perspective_v2,
-	evaluation_to_paper_pawns,
+from board_features import (
+	BOARD_SIZE,
+	PERSPECTIVE_V3_BOARD_FEATURE_SIZE,
+	PERSPECTIVE_V3_FEATURE_SIZE,
+	PERSPECTIVE_V3_METADATA_SIZE,
+	encode_fen_perspective_v3,
+	evaluation_to_pawns,
 	hash_fraction,
-	position_key,
 	selected_for_sample,
 	split_for_fen,
 )
@@ -41,34 +33,9 @@ from encoded_cache import (
 ROOT_DIR = Path(__file__).resolve().parents[2]
 AI_DIR = Path(__file__).resolve().parent
 DEFAULT_DATA_FILE = ROOT_DIR / "data" / "chessData_depth8.csv"
-ARCHITECTURE_PAPER_MLP = "paper-mlp"
-ARCHITECTURE_TRANSFORMER = "transformer"
-ARCHITECTURE_ATTACK_TRANSFORMER = "attack-transformer"
-ARCHITECTURE_PERSPECTIVE_TRANSFORMER = "perspective-transformer"
-ARCHITECTURE_PERSPECTIVE_TRANSFORMER_V2 = "perspective-transformer-v2"
-DEFAULT_ARCHITECTURE = ARCHITECTURE_PERSPECTIVE_TRANSFORMER_V2
-DEFAULT_OUTPUTS = {
-	ARCHITECTURE_PAPER_MLP: (
-		AI_DIR / "position_evaluator_paper_mlp_mae.keras",
-		AI_DIR / "position_evaluator_paper_mlp_mae.weights.h5",
-	),
-	ARCHITECTURE_TRANSFORMER: (
-		AI_DIR / "position_evaluator_transformer_mae.keras",
-		AI_DIR / "position_evaluator_transformer_mae.weights.h5",
-	),
-	ARCHITECTURE_ATTACK_TRANSFORMER: (
-		AI_DIR / "position_evaluator_attack_transformer_mae.keras",
-		AI_DIR / "position_evaluator_attack_transformer_mae.weights.h5",
-	),
-	ARCHITECTURE_PERSPECTIVE_TRANSFORMER: (
-		AI_DIR / "position_evaluator_perspective_transformer_mae.keras",
-		AI_DIR / "position_evaluator_perspective_transformer_mae.weights.h5",
-	),
-	ARCHITECTURE_PERSPECTIVE_TRANSFORMER_V2: (
-		AI_DIR / "position_evaluator_perspective_transformer_v2_mae.keras",
-		AI_DIR / "position_evaluator_perspective_transformer_v2_mae.weights.h5",
-	),
-}
+ARCHITECTURE = "perspective-transformer-v3"
+DEFAULT_MODEL_OUT = AI_DIR / "position_evaluator_perspective_transformer_v3_mae.keras"
+DEFAULT_WEIGHTS_OUT = AI_DIR / "position_evaluator_perspective_transformer_v3_mae.weights.h5"
 DEFAULT_LEARNING_RATE = 0.001
 DEFAULT_MIN_LEARNING_RATE = 0.000001
 DEFAULT_MAX_ABS_PAWNS = 10.0
@@ -82,23 +49,14 @@ DEFAULT_SPLIT_COUNTS_BY_SAMPLE = {
 		"test": 300_099,
 	},
 }
-DEFAULT_EXTRA_DATA_FILES = (
-	ROOT_DIR / "data" / "random_evals.csv",
-	ROOT_DIR / "data" / "tactic_evals.csv",
-)
-DEFAULT_EXTRA_SOURCE_ROWS = {
-	"random_evals.csv": 1_000_273,
-	"tactic_evals.csv": 2_628_219,
-}
 DEFAULT_TRAIN_SPLIT_EVAL_EXAMPLES = 100_000
 
 
 def default_cache_dir_for(data_file):
-	return ROOT_DIR / "data" / "encoded" / f"{Path(data_file).stem}_perspective_v2"
+	return ROOT_DIR / "data" / "encoded" / f"{Path(data_file).stem}_perspective_v3"
 
 
 def completed_epochs_from_history(log_path):
-	"""Number of completed epochs recorded in a training history CSV."""
 	log_path = Path(log_path)
 	if not log_path.is_file():
 		return 0
@@ -113,7 +71,6 @@ def completed_epochs_from_history(log_path):
 
 
 def best_metric_from_history(log_path, metric):
-	"""Lowest value of a metric column in a training history CSV, or None."""
 	log_path = Path(log_path)
 	if not log_path.is_file():
 		return None
@@ -131,33 +88,17 @@ def best_metric_from_history(log_path, metric):
 
 def parse_args():
 	parser = argparse.ArgumentParser(
-		description="Train a depth-8 chess position evaluator."
+		description="Train the perspective-transformer-v3 position evaluator."
 	)
 	parser.add_argument("--data-file", type=Path, default=DEFAULT_DATA_FILE)
 	parser.add_argument(
 		"--architecture",
-		choices=(
-			ARCHITECTURE_PAPER_MLP,
-			ARCHITECTURE_TRANSFORMER,
-			ARCHITECTURE_ATTACK_TRANSFORMER,
-			ARCHITECTURE_PERSPECTIVE_TRANSFORMER,
-			ARCHITECTURE_PERSPECTIVE_TRANSFORMER_V2,
-		),
-		default=DEFAULT_ARCHITECTURE,
-		help="Model architecture to train.",
+		choices=(ARCHITECTURE,),
+		default=ARCHITECTURE,
+		help="Model architecture (only perspective-transformer-v3 remains).",
 	)
-	parser.add_argument(
-		"--model-out",
-		type=Path,
-		default=None,
-		help="Output .keras checkpoint. Defaults depend on --architecture.",
-	)
-	parser.add_argument(
-		"--weights-out",
-		type=Path,
-		default=None,
-		help="Output .weights.h5 checkpoint. Defaults depend on --architecture.",
-	)
+	parser.add_argument("--model-out", type=Path, default=None)
+	parser.add_argument("--weights-out", type=Path, default=None)
 	parser.add_argument(
 		"--initial-weights",
 		type=Path,
@@ -170,8 +111,7 @@ def parse_args():
 		default=0,
 		help=(
 			"Epoch to resume from (0-based). Offsets the warmup-cosine LR "
-			"schedule by initial-epoch * steps-per-epoch and appends to the "
-			"history CSV instead of overwriting it."
+			"schedule and appends to the history CSV instead of overwriting."
 		),
 	)
 	parser.add_argument(
@@ -179,20 +119,11 @@ def parse_args():
 		action="store_true",
 		help=(
 			"Continue an interrupted run: load --weights-out when it exists "
-			"and derive --initial-epoch from the history CSV. Starts fresh "
-			"when there is no checkpoint yet. The checkpoint holds the best "
-			"epoch's weights, not the last epoch's."
+			"and derive --initial-epoch from the history CSV. The checkpoint "
+			"holds the best epoch's weights, not the last epoch's."
 		),
 	)
-	parser.add_argument(
-		"--epochs",
-		type=int,
-		default=DEFAULT_EPOCHS,
-		help=(
-			"Training epochs. The default is sized for the transformer "
-			"architectures; pass a higher value for long paper-MLP runs."
-		),
-	)
+	parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
 	parser.add_argument("--batch-size", type=int, default=512)
 	parser.add_argument("--learning-rate", type=float, default=DEFAULT_LEARNING_RATE)
 	parser.add_argument("--min-learning-rate", type=float, default=DEFAULT_MIN_LEARNING_RATE)
@@ -200,7 +131,6 @@ def parse_args():
 		"--lr-schedule",
 		choices=("constant", "warmup-cosine"),
 		default="warmup-cosine",
-		help="Learning-rate schedule for optimizer training.",
 	)
 	parser.add_argument(
 		"--warmup-ratio",
@@ -212,7 +142,7 @@ def parse_args():
 		"--warmup-epochs",
 		type=float,
 		default=2.0,
-		help="Number of epochs to spend warming up. Overrides --warmup-ratio unless --warmup-steps is set.",
+		help="Epochs spent warming up. Overrides --warmup-ratio unless --warmup-steps is set.",
 	)
 	parser.add_argument(
 		"--warmup-steps",
@@ -220,32 +150,22 @@ def parse_args():
 		default=None,
 		help="Exact warmup steps. Overrides --warmup-epochs and --warmup-ratio.",
 	)
-	parser.add_argument("--momentum", type=float, default=0.7)
 	parser.add_argument(
 		"--optimizer",
-		choices=("auto", "sgd", "adamw", "adam"),
-		default="auto",
-		help=(
-			"Optimizer to use. auto uses SGD for the paper MLP and AdamW "
-			"for the transformer."
-		),
+		choices=("adamw", "adam"),
+		default="adamw",
 	)
-	parser.add_argument(
-		"--weight-decay",
-		type=float,
-		default=1e-4,
-		help="AdamW weight decay for transformer training.",
-	)
+	parser.add_argument("--weight-decay", type=float, default=1e-4)
 	parser.add_argument(
 		"--gradient-clipnorm",
 		type=float,
 		default=1.0,
 		help="Global gradient norm clip. Set to 0 to disable.",
 	)
-	parser.add_argument("--transformer-d-model", type=int, default=256)
+	parser.add_argument("--transformer-d-model", type=int, default=384)
 	parser.add_argument("--transformer-heads", type=int, default=8)
 	parser.add_argument("--transformer-layers", type=int, default=6)
-	parser.add_argument("--transformer-ff-dim", type=int, default=1024)
+	parser.add_argument("--transformer-ff-dim", type=int, default=1536)
 	parser.add_argument("--transformer-dropout", type=float, default=0.05)
 	parser.add_argument(
 		"--loss",
@@ -258,7 +178,7 @@ def parse_args():
 		"--mixed-precision",
 		choices=("auto", "on", "off"),
 		default="auto",
-		help="Use mixed_float16 on GPU to reduce memory use. auto enables it when a GPU is present.",
+		help="Use mixed_float16 on GPU. auto enables it when a GPU is present.",
 	)
 	parser.add_argument(
 		"--extra-data-file",
@@ -268,22 +188,12 @@ def parse_args():
 		help="Additional CSV used for training only. May be passed more than once.",
 	)
 	parser.add_argument(
-		"--default-extra-data",
-		action=argparse.BooleanOptionalAction,
-		default=False,
-		help=(
-			"Add data/random_evals.csv and data/tactic_evals.csv to training. "
-			"Off by default: their evaluations are far larger on average than "
-			"the depth-8 data and drown out its signal."
-		),
-	)
-	parser.add_argument(
 		"--encoded-cache-dir",
 		type=Path,
 		default=None,
 		help=(
 			"Directory of pre-encoded positions built by encode_dataset.py. "
-			"Auto-detected for perspective-transformer-v2 when present."
+			"Auto-detected when present."
 		),
 	)
 	parser.add_argument(
@@ -313,8 +223,8 @@ def parse_args():
 	parser.add_argument(
 		"--mirror-augmentation",
 		action=argparse.BooleanOptionalAction,
-		default=None,
-		help="Train with horizontal mirror augmentation. Defaults on for perspective-transformer-v2.",
+		default=True,
+		help="Train with horizontal mirror augmentation.",
 	)
 	parser.add_argument(
 		"--sample-size",
@@ -330,16 +240,8 @@ def parse_args():
 		action="store_true",
 		help="Count and split-scan the CSV instead of using known default counts.",
 	)
-	parser.add_argument(
-		"--sample-seed",
-		default="sabatelli-dataset4-sample-v1",
-		help="Seed for deterministic position sampling.",
-	)
-	parser.add_argument(
-		"--split-seed",
-		default="sabatelli-dataset4-split-v1",
-		help="Seed for the deterministic 80/10/10 position split.",
-	)
+	parser.add_argument("--sample-seed", default="sabatelli-dataset4-sample-v1")
+	parser.add_argument("--split-seed", default="sabatelli-dataset4-split-v1")
 	parser.add_argument(
 		"--max-abs-pawns",
 		type=float,
@@ -353,24 +255,9 @@ def parse_args():
 		default=None,
 		help="Optional source-row cap for smoke tests.",
 	)
-	parser.add_argument(
-		"--steps-per-epoch",
-		type=int,
-		default=None,
-		help="Optional cap on training steps per epoch.",
-	)
-	parser.add_argument(
-		"--validation-steps",
-		type=int,
-		default=None,
-		help="Optional cap on validation steps.",
-	)
-	parser.add_argument(
-		"--test-steps",
-		type=int,
-		default=None,
-		help="Optional cap on final test steps.",
-	)
+	parser.add_argument("--steps-per-epoch", type=int, default=None)
+	parser.add_argument("--validation-steps", type=int, default=None)
+	parser.add_argument("--test-steps", type=int, default=None)
 	parser.add_argument(
 		"--dry-run",
 		action="store_true",
@@ -380,39 +267,17 @@ def parse_args():
 		"--target-mae",
 		type=float,
 		default=0.5,
-		help="Stop training after an epoch where train and validation MAE are at or below this value. Set to 0 to disable.",
+		help="Stop after an epoch where train and validation MAE reach this value. 0 disables.",
 	)
-	parser.add_argument(
-		"--early-stopping-patience",
-		type=int,
-		default=18,
-		help="Epochs without monitored MAE improvement before stopping. Set to 0 to disable.",
-	)
-	parser.add_argument(
-		"--early-stopping-min-delta",
-		type=float,
-		default=0.001,
-		help="Minimum monitored MAE improvement for early stopping.",
-	)
-	parser.add_argument(
-		"--report-out",
-		type=Path,
-		default=None,
-		help="Output JSON training report. Defaults next to --model-out.",
-	)
-	parser.add_argument(
-		"--log-out",
-		type=Path,
-		default=None,
-		help="Per-epoch CSV training log. Defaults next to --model-out.",
-	)
+	parser.add_argument("--early-stopping-patience", type=int, default=18)
+	parser.add_argument("--early-stopping-min-delta", type=float, default=0.001)
+	parser.add_argument("--report-out", type=Path, default=None)
+	parser.add_argument("--log-out", type=Path, default=None)
 	args = parser.parse_args()
-	if args.model_out is None or args.weights_out is None:
-		default_model_out, default_weights_out = DEFAULT_OUTPUTS[args.architecture]
-		if args.model_out is None:
-			args.model_out = default_model_out
-		if args.weights_out is None:
-			args.weights_out = default_weights_out
+	if args.model_out is None:
+		args.model_out = DEFAULT_MODEL_OUT
+	if args.weights_out is None:
+		args.weights_out = DEFAULT_WEIGHTS_OUT
 	if args.report_out is None:
 		args.report_out = args.model_out.with_suffix(".training_report.json")
 	if args.log_out is None:
@@ -427,23 +292,12 @@ def parse_args():
 			args.initial_epoch = completed_epochs_from_history(args.log_out)
 	if args.extra_data_file is None:
 		args.extra_data_file = []
-	if args.default_extra_data:
-		args.extra_data_file = list(args.extra_data_file) + [
-			path for path in DEFAULT_EXTRA_DATA_FILES if path.is_file()
-		]
 	args.extra_data_file = list(dict.fromkeys(path.resolve() for path in args.extra_data_file))
 	if args.extra_cache_dir is None:
 		args.extra_cache_dir = []
-	if args.mirror_augmentation is None:
-		args.mirror_augmentation = (
-			args.architecture == ARCHITECTURE_PERSPECTIVE_TRANSFORMER_V2
-		)
 	if args.no_encoded_cache:
 		args.encoded_cache_dir = None
-	elif (
-		args.encoded_cache_dir is None
-		and args.architecture == ARCHITECTURE_PERSPECTIVE_TRANSFORMER_V2
-	):
+	elif args.encoded_cache_dir is None:
 		candidate = default_cache_dir_for(args.data_file)
 		if (candidate / CACHE_MANIFEST_NAME).is_file():
 			args.encoded_cache_dir = candidate
@@ -472,11 +326,6 @@ def validate_args(args):
 		if not extra_data_file.is_file():
 			raise FileNotFoundError(extra_data_file)
 	if args.encoded_cache_dir is not None:
-		if args.architecture != ARCHITECTURE_PERSPECTIVE_TRANSFORMER_V2:
-			raise ValueError(
-				"--encoded-cache-dir is only supported by "
-				"perspective-transformer-v2"
-			)
 		if not (args.encoded_cache_dir / CACHE_MANIFEST_NAME).is_file():
 			raise FileNotFoundError(
 				f"{args.encoded_cache_dir / CACHE_MANIFEST_NAME}; "
@@ -515,8 +364,6 @@ def validate_args(args):
 		raise ValueError("--warmup-epochs cannot be negative")
 	if args.warmup_steps is not None and args.warmup_steps < 0:
 		raise ValueError("--warmup-steps cannot be negative")
-	if args.momentum < 0 or args.momentum >= 1:
-		raise ValueError("--momentum must be in [0, 1)")
 	if args.weight_decay < 0:
 		raise ValueError("--weight-decay cannot be negative")
 	if args.gradient_clipnorm < 0:
@@ -537,13 +384,6 @@ def validate_args(args):
 		raise ValueError("--huber-delta must be positive")
 	if args.sample_size < 0:
 		raise ValueError("--sample-size cannot be negative")
-	if (
-		args.mirror_augmentation
-		and args.architecture != ARCHITECTURE_PERSPECTIVE_TRANSFORMER_V2
-	):
-		raise ValueError(
-			"--mirror-augmentation is only supported by perspective-transformer-v2"
-		)
 	if args.max_abs_pawns <= 0:
 		raise ValueError("--max-abs-pawns must be positive")
 	if args.target_mae < 0:
@@ -556,10 +396,8 @@ def validate_args(args):
 		raise ValueError("--shuffle-buffer cannot be negative")
 	if args.max_rows is not None and args.max_rows < 1:
 		raise ValueError("--max-rows must be positive")
-	for name in ("steps_per_epoch",):
-		value = getattr(args, name)
-		if value is not None and value < 1:
-			raise ValueError(f"--{name.replace('_', '-')} must be positive")
+	if args.steps_per_epoch is not None and args.steps_per_epoch < 1:
+		raise ValueError("--steps-per-epoch must be positive")
 	for name in ("validation_steps", "test_steps"):
 		value = getattr(args, name)
 		if value is not None and value < 0:
@@ -568,32 +406,29 @@ def validate_args(args):
 		raise ValueError("--weights-out must end with .weights.h5")
 
 
-def build_paper_mlp_model(max_abs_pawns=DEFAULT_MAX_ABS_PAWNS):
-	inputs = tf.keras.Input(
-		shape=(PAPER_BITMAP_FEATURE_SIZE,), name="bitmap_position"
-	)
-	x = tf.keras.layers.Dense(2048, activation="elu", name="hidden_1")(inputs)
-	x = tf.keras.layers.BatchNormalization(name="batch_norm_1")(x)
-	x = tf.keras.layers.Dense(2048, activation="elu", name="hidden_2")(x)
-	x = tf.keras.layers.BatchNormalization(name="batch_norm_2")(x)
-	x = tf.keras.layers.Dense(2048, activation="elu", name="hidden_3")(x)
-	unit_score = tf.keras.layers.Dense(
-		1,
-		activation="tanh",
-		kernel_initializer="zeros",
-		bias_initializer="zeros",
-		name="bounded_unit_score",
-	)(x)
-	outputs = tf.keras.layers.Rescaling(
-		scale=max_abs_pawns, name="side_to_move_pawn_score"
-	)(unit_score)
+@tf.keras.utils.register_keras_serializable(package="ChessAI")
+class SquarePositionEmbedding(tf.keras.layers.Layer):
+	"""Add a learned absolute embedding for each of the 64 board squares."""
 
-	model = tf.keras.Model(
-		inputs=inputs,
-		outputs=outputs,
-		name="sabatelli_bitmap_mlp",
-	)
-	return model
+	def __init__(self, square_count=BOARD_SIZE * BOARD_SIZE, **kwargs):
+		super().__init__(**kwargs)
+		self.square_count = square_count
+
+	def build(self, input_shape):
+		self.position_embeddings = self.add_weight(
+			name="position_embeddings",
+			shape=(self.square_count, int(input_shape[-1])),
+			initializer="random_normal",
+			trainable=True,
+		)
+
+	def call(self, inputs):
+		return inputs + self.position_embeddings[tf.newaxis, :, :]
+
+	def get_config(self):
+		config = super().get_config()
+		config.update({"square_count": self.square_count})
+		return config
 
 
 def transformer_encoder_block(
@@ -640,72 +475,20 @@ def transformer_encoder_block(
 	)
 
 
-def build_transformer_model(
-	d_model=128,
-	heads=8,
-	layers=4,
-	ff_dim=512,
-	dropout=0.1,
-	max_abs_pawns=DEFAULT_MAX_ABS_PAWNS,
-):
-	inputs = tf.keras.Input(
-		shape=(PAPER_BITMAP_FEATURE_SIZE,), name="bitmap_position"
-	)
-	x = tf.keras.layers.Reshape((64, 12), name="square_piece_planes")(inputs)
-	x = tf.keras.layers.Dense(d_model, name="square_projection")(x)
-	x = SquarePositionEmbedding(name="square_position_embedding")(x)
-	x = tf.keras.layers.Dropout(dropout, name="input_dropout")(x)
-
-	for block_index in range(1, layers + 1):
-		x = transformer_encoder_block(
-			x=x,
-			d_model=d_model,
-			heads=heads,
-			ff_dim=ff_dim,
-			dropout=dropout,
-			block_index=block_index,
-		)
-
-	x = tf.keras.layers.LayerNormalization(epsilon=1e-6, name="final_norm")(x)
-	x = tf.keras.layers.GlobalAveragePooling1D(name="square_mean_pool")(x)
-	x = tf.keras.layers.Dense(
-		ff_dim, activation="gelu", name="evaluation_head_hidden"
-	)(x)
-	x = tf.keras.layers.Dropout(dropout, name="evaluation_head_dropout")(x)
-	unit_score = tf.keras.layers.Dense(
-		1,
-		activation="tanh",
-		kernel_initializer="zeros",
-		bias_initializer="zeros",
-		name="bounded_unit_score",
-	)(x)
-	outputs = tf.keras.layers.Rescaling(
-		scale=max_abs_pawns, name="side_to_move_pawn_score"
-	)(unit_score)
-
-	return tf.keras.Model(
-		inputs=inputs,
-		outputs=outputs,
-		name="bitmap_transformer",
-	)
-
-
-def build_feature_transformer_model(
-	input_size,
-	board_feature_size,
-	metadata_size,
-	square_plane_count,
-	name,
-	d_model=256,
+def build_perspective_transformer_v3_model(
+	d_model=384,
 	heads=8,
 	layers=6,
-	ff_dim=1024,
-	dropout=0.1,
+	ff_dim=1536,
+	dropout=0.05,
 ):
-	inputs = tf.keras.Input(shape=(input_size,), name="position_features")
+	board_feature_size = PERSPECTIVE_V3_BOARD_FEATURE_SIZE
+	inputs = tf.keras.Input(
+		shape=(PERSPECTIVE_V3_FEATURE_SIZE,), name="position_features"
+	)
 	board_inputs = inputs[:, :board_feature_size]
 	x = tf.keras.layers.Reshape(
-		(64, square_plane_count), name="square_feature_planes"
+		(64, board_feature_size // 64), name="square_feature_planes"
 	)(board_inputs)
 	x = tf.keras.layers.Dense(d_model, name="square_projection")(x)
 	x = SquarePositionEmbedding(name="square_position_embedding")(x)
@@ -724,24 +507,20 @@ def build_feature_transformer_model(
 	x = tf.keras.layers.LayerNormalization(epsilon=1e-6, name="final_norm")(x)
 	mean_pool = tf.keras.layers.GlobalAveragePooling1D(name="square_mean_pool")(x)
 	max_pool = tf.keras.layers.GlobalMaxPooling1D(name="square_max_pool")(x)
-	head_inputs = [mean_pool, max_pool]
 
-	if metadata_size > 0:
-		metadata_inputs = inputs[:, board_feature_size:]
-		metadata = tf.keras.layers.LayerNormalization(
-			epsilon=1e-6, name="metadata_norm"
-		)(metadata_inputs)
-		metadata = tf.keras.layers.Dense(
-			max(32, d_model // 2),
-			activation="gelu",
-			name="metadata_projection",
-		)(metadata)
-		head_inputs.append(metadata)
+	metadata_inputs = inputs[:, board_feature_size:]
+	metadata = tf.keras.layers.LayerNormalization(
+		epsilon=1e-6, name="metadata_norm"
+	)(metadata_inputs)
+	metadata = tf.keras.layers.Dense(
+		max(32, d_model // 2),
+		activation="gelu",
+		name="metadata_projection",
+	)(metadata)
 
-	if len(head_inputs) == 1:
-		x = head_inputs[0]
-	else:
-		x = tf.keras.layers.Concatenate(name="pooled_features")(head_inputs)
+	x = tf.keras.layers.Concatenate(name="pooled_features")(
+		[mean_pool, max_pool, metadata]
+	)
 	x = tf.keras.layers.LayerNormalization(epsilon=1e-6, name="head_norm")(x)
 	x = tf.keras.layers.Dense(
 		ff_dim, activation="gelu", name="evaluation_head_hidden_1"
@@ -758,118 +537,9 @@ def build_feature_transformer_model(
 		dtype="float32",
 		name="side_to_move_pawn_score",
 	)(x)
-
-	return tf.keras.Model(inputs=inputs, outputs=outputs, name=name)
-
-
-def build_attack_transformer_model(
-	d_model=256,
-	heads=8,
-	layers=6,
-	ff_dim=1024,
-	dropout=0.1,
-):
-	return build_feature_transformer_model(
-		input_size=ATTACK_FEATURE_SIZE,
-		board_feature_size=ATTACK_BOARD_FEATURE_SIZE,
-		metadata_size=ATTACK_FEATURE_SIZE - ATTACK_BOARD_FEATURE_SIZE,
-		square_plane_count=ATTACK_BOARD_FEATURE_SIZE // 64,
-		name="attack_transformer",
-		d_model=d_model,
-		heads=heads,
-		layers=layers,
-		ff_dim=ff_dim,
-		dropout=dropout,
+	return tf.keras.Model(
+		inputs=inputs, outputs=outputs, name="perspective_transformer_v3"
 	)
-
-
-def build_perspective_transformer_model(
-	d_model=256,
-	heads=8,
-	layers=6,
-	ff_dim=1024,
-	dropout=0.1,
-):
-	return build_feature_transformer_model(
-		input_size=PERSPECTIVE_FEATURE_SIZE,
-		board_feature_size=ATTACK_BOARD_FEATURE_SIZE,
-		metadata_size=PERSPECTIVE_METADATA_SIZE,
-		square_plane_count=ATTACK_BOARD_FEATURE_SIZE // 64,
-		name="perspective_transformer",
-		d_model=d_model,
-		heads=heads,
-		layers=layers,
-		ff_dim=ff_dim,
-		dropout=dropout,
-	)
-
-
-def build_perspective_transformer_v2_model(
-	d_model=256,
-	heads=8,
-	layers=6,
-	ff_dim=1024,
-	dropout=0.1,
-):
-	return build_feature_transformer_model(
-		input_size=PERSPECTIVE_V2_FEATURE_SIZE,
-		board_feature_size=ATTACK_BOARD_FEATURE_SIZE,
-		metadata_size=PERSPECTIVE_V2_METADATA_SIZE,
-		square_plane_count=ATTACK_BOARD_FEATURE_SIZE // 64,
-		name="perspective_transformer_v2",
-		d_model=d_model,
-		heads=heads,
-		layers=layers,
-		ff_dim=ff_dim,
-		dropout=dropout,
-	)
-
-
-def feature_size_for_architecture(architecture):
-	if architecture in (ARCHITECTURE_PAPER_MLP, ARCHITECTURE_TRANSFORMER):
-		return PAPER_BITMAP_FEATURE_SIZE
-	if architecture == ARCHITECTURE_ATTACK_TRANSFORMER:
-		return ATTACK_FEATURE_SIZE
-	if architecture == ARCHITECTURE_PERSPECTIVE_TRANSFORMER:
-		return PERSPECTIVE_FEATURE_SIZE
-	if architecture == ARCHITECTURE_PERSPECTIVE_TRANSFORMER_V2:
-		return PERSPECTIVE_V2_FEATURE_SIZE
-	raise ValueError(f"unknown architecture: {architecture}")
-
-
-def encode_fen_for_architecture(fen, architecture, mirror_files=False):
-	if architecture in (ARCHITECTURE_PAPER_MLP, ARCHITECTURE_TRANSFORMER):
-		return encode_fen_paper_bitmap(fen)
-	if architecture == ARCHITECTURE_ATTACK_TRANSFORMER:
-		return encode_fen(fen, include_attack_maps=True)
-	if architecture == ARCHITECTURE_PERSPECTIVE_TRANSFORMER:
-		return encode_fen_perspective(fen, mirror_files=mirror_files)
-	if architecture == ARCHITECTURE_PERSPECTIVE_TRANSFORMER_V2:
-		return encode_fen_perspective_v2(fen, mirror_files=mirror_files)
-	raise ValueError(f"unknown architecture: {architecture}")
-
-
-def input_description_for_architecture(architecture):
-	if architecture in (ARCHITECTURE_PAPER_MLP, ARCHITECTURE_TRANSFORMER):
-		return f"{PAPER_BITMAP_FEATURE_SIZE} paper bitmap values"
-	if architecture == ARCHITECTURE_ATTACK_TRANSFORMER:
-		return (
-			f"{ATTACK_FEATURE_SIZE} values: {ATTACK_BOARD_FEATURE_SIZE} "
-			"piece/attack board values and 7 metadata values"
-		)
-	if architecture == ARCHITECTURE_PERSPECTIVE_TRANSFORMER:
-		return (
-			f"{PERSPECTIVE_FEATURE_SIZE} values: {ATTACK_BOARD_FEATURE_SIZE} "
-			f"side-to-move perspective piece/attack board values and "
-			f"{PERSPECTIVE_METADATA_SIZE} metadata values"
-		)
-	if architecture == ARCHITECTURE_PERSPECTIVE_TRANSFORMER_V2:
-		return (
-			f"{PERSPECTIVE_V2_FEATURE_SIZE} values: {ATTACK_BOARD_FEATURE_SIZE} "
-			f"side-to-move perspective piece/attack board values and "
-			f"{PERSPECTIVE_V2_METADATA_SIZE} metadata values"
-		)
-	raise ValueError(f"unknown architecture: {architecture}")
 
 
 @tf.keras.utils.register_keras_serializable(package="ChessAI")
@@ -929,14 +599,6 @@ class WarmupCosineDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
 		}
 
 
-def resolved_optimizer_name(args):
-	if args.optimizer != "auto":
-		return args.optimizer
-	if args.architecture == ARCHITECTURE_PAPER_MLP:
-		return "sgd"
-	return "adamw"
-
-
 def warmup_steps_for_training(args):
 	total_steps = getattr(args, "total_train_steps", None)
 	steps_per_epoch = getattr(args, "train_steps_per_epoch", None)
@@ -967,19 +629,11 @@ def learning_rate_for_optimizer(args):
 
 
 def build_optimizer(args):
-	optimizer_name = resolved_optimizer_name(args)
 	learning_rate = learning_rate_for_optimizer(args)
 	clip_kwargs = {}
 	if args.gradient_clipnorm > 0:
 		clip_kwargs["clipnorm"] = args.gradient_clipnorm
-	if optimizer_name == "sgd":
-		return tf.keras.optimizers.SGD(
-			learning_rate=learning_rate,
-			momentum=args.momentum,
-			nesterov=True,
-			**clip_kwargs,
-		)
-	if optimizer_name == "adamw":
+	if args.optimizer == "adamw":
 		adamw_optimizer = getattr(tf.keras.optimizers, "AdamW", None)
 		if adamw_optimizer is None:
 			experimental_optimizers = getattr(
@@ -1018,16 +672,10 @@ def learning_rate_description(args):
 
 
 def optimizer_description(args):
-	optimizer_name = resolved_optimizer_name(args)
 	clip_description = ""
 	if args.gradient_clipnorm > 0:
 		clip_description = f", clipnorm={args.gradient_clipnorm:g}"
-	if optimizer_name == "sgd":
-		return (
-			f"SGD({learning_rate_description(args)}, momentum={args.momentum:g}, "
-			f"nesterov=True{clip_description})"
-		)
-	if optimizer_name == "adamw":
+	if args.optimizer == "adamw":
 		return (
 			f"AdamW({learning_rate_description(args)}, "
 			f"weight_decay={args.weight_decay:g}{clip_description})"
@@ -1050,10 +698,9 @@ def loss_description(args):
 class TrainSplitMae(tf.keras.callbacks.Callback):
 	"""Log inference-mode MAE on a fixed training-split subsample.
 
-	The metric reported by Keras during training is computed with dropout
-	active and, when extra datasets are mixed in, over a different label
-	distribution than validation. This callback gives a train-split number
-	that is directly comparable to val_mae.
+	The metric Keras reports during training is computed with dropout
+	active; this callback gives a train-split number directly comparable
+	to val_mae.
 	"""
 
 	def __init__(self, dataset):
@@ -1079,8 +726,6 @@ class TargetMaeStop(tf.keras.callbacks.Callback):
 		if self.target_mae <= 0:
 			return
 		logs = logs or {}
-		# Prefer the inference-mode train-split metric when it is logged;
-		# the raw training metric includes dropout noise and augmentation.
 		train_metric = "train_split_mae" if "train_split_mae" in logs else "mae"
 		train_mae = logs.get(train_metric)
 		val_mae = logs.get("val_mae")
@@ -1103,54 +748,20 @@ class TargetMaeStop(tf.keras.callbacks.Callback):
 		self.model.stop_training = True
 
 
-def compile_model(model, args):
+def build_model(args):
+	model = build_perspective_transformer_v3_model(
+		d_model=args.transformer_d_model,
+		heads=args.transformer_heads,
+		layers=args.transformer_layers,
+		ff_dim=args.transformer_ff_dim,
+		dropout=args.transformer_dropout,
+	)
 	model.compile(
 		optimizer=build_optimizer(args),
 		loss=loss_for_training(args),
 		metrics=[tf.keras.metrics.MeanAbsoluteError(name="mae")],
 	)
 	return model
-
-
-def build_model(args):
-	if args.architecture == ARCHITECTURE_PAPER_MLP:
-		model = build_paper_mlp_model(max_abs_pawns=args.max_abs_pawns)
-	elif args.architecture == ARCHITECTURE_TRANSFORMER:
-		model = build_transformer_model(
-			d_model=args.transformer_d_model,
-			heads=args.transformer_heads,
-			layers=args.transformer_layers,
-			ff_dim=args.transformer_ff_dim,
-			dropout=args.transformer_dropout,
-			max_abs_pawns=args.max_abs_pawns,
-		)
-	elif args.architecture == ARCHITECTURE_ATTACK_TRANSFORMER:
-		model = build_attack_transformer_model(
-			d_model=args.transformer_d_model,
-			heads=args.transformer_heads,
-			layers=args.transformer_layers,
-			ff_dim=args.transformer_ff_dim,
-			dropout=args.transformer_dropout,
-		)
-	elif args.architecture == ARCHITECTURE_PERSPECTIVE_TRANSFORMER:
-		model = build_perspective_transformer_model(
-			d_model=args.transformer_d_model,
-			heads=args.transformer_heads,
-			layers=args.transformer_layers,
-			ff_dim=args.transformer_ff_dim,
-			dropout=args.transformer_dropout,
-		)
-	elif args.architecture == ARCHITECTURE_PERSPECTIVE_TRANSFORMER_V2:
-		model = build_perspective_transformer_v2_model(
-			d_model=args.transformer_d_model,
-			heads=args.transformer_heads,
-			layers=args.transformer_layers,
-			ff_dim=args.transformer_ff_dim,
-			dropout=args.transformer_dropout,
-		)
-	else:
-		raise ValueError(f"unknown architecture: {args.architecture}")
-	return compile_model(model, args)
 
 
 def count_source_rows(path, max_rows):
@@ -1187,17 +798,10 @@ def count_split_rows(path, raw_rows, sample_fraction, sample_seed, split_seed):
 
 
 def count_extra_rows(args):
-	counts = {}
-	for path in args.extra_data_file:
-		if (
-			args.max_rows is None
-			and path.name in DEFAULT_EXTRA_SOURCE_ROWS
-			and path.resolve().parent == (ROOT_DIR / "data").resolve()
-		):
-			counts[path] = DEFAULT_EXTRA_SOURCE_ROWS[path.name]
-		else:
-			counts[path] = count_source_rows(path, args.max_rows)
-	return counts
+	return {
+		path: count_source_rows(path, args.max_rows)
+		for path in args.extra_data_file
+	}
 
 
 def validate_csv_header(fieldnames):
@@ -1215,7 +819,6 @@ def iter_examples(
 	sample_seed,
 	split_seed,
 	max_abs_pawns,
-	architecture,
 	augment_mirror=False,
 	train_only=False,
 ):
@@ -1233,18 +836,14 @@ def iter_examples(
 				if split_for_fen(fen, split_seed) != split:
 					continue
 
-			target = evaluation_to_paper_pawns(
+			target = evaluation_to_pawns(
 				row["Evaluation"],
 				max_abs_pawns=max_abs_pawns,
 			)
 			target_array = np.array([target], dtype=np.float32)
-			yield encode_fen_for_architecture(
-				fen, architecture, mirror_files=False
-			), target_array
+			yield encode_fen_perspective_v3(fen), target_array
 			if augment_mirror:
-				yield encode_fen_for_architecture(
-					fen, architecture, mirror_files=True
-				), target_array
+				yield encode_fen_perspective_v3(fen, mirror_files=True), target_array
 
 
 def make_example_dataset(
@@ -1265,15 +864,11 @@ def make_example_dataset(
 			sample_seed=args.sample_seed,
 			split_seed=args.split_seed,
 			max_abs_pawns=args.max_abs_pawns,
-			architecture=args.architecture,
 			augment_mirror=augment_mirror,
 			train_only=train_only,
 		),
 		output_signature=(
-			tf.TensorSpec(
-				shape=(feature_size_for_architecture(args.architecture),),
-				dtype=tf.float32,
-			),
+			tf.TensorSpec(shape=(PERSPECTIVE_V3_FEATURE_SIZE,), dtype=tf.float32),
 			tf.TensorSpec(shape=(1,), dtype=tf.float32),
 		),
 	)
@@ -1377,7 +972,6 @@ def make_cached_dataset(
 	mirror=False,
 	seed=0,
 ):
-	"""Batched (features, target) dataset over rows of an encoded cache."""
 	fetch = make_cached_batch_fetcher(cache, args.max_abs_pawns)
 	dataset = tf.data.Dataset.from_tensor_slices(np.asarray(indices, dtype=np.int64))
 	if shuffle:
@@ -1400,7 +994,7 @@ def make_cached_dataset(
 		features, batch_targets = tf.numpy_function(
 			fetch, [batch_indices, mirror_flags], (tf.float32, tf.float32)
 		)
-		features.set_shape((None, PERSPECTIVE_V2_FEATURE_SIZE))
+		features.set_shape((None, PERSPECTIVE_V3_FEATURE_SIZE))
 		batch_targets.set_shape((None, 1))
 		return features, batch_targets
 
@@ -1592,15 +1186,11 @@ def evaluate_validation_buckets(model, args, raw_rows, sample_fraction, steps):
 			if split_for_fen(fen, args.split_seed) != "validation":
 				continue
 
-			target = evaluation_to_paper_pawns(
+			target = evaluation_to_pawns(
 				row["Evaluation"],
 				max_abs_pawns=args.max_abs_pawns,
 			)
-			features_batch.append(
-				encode_fen_for_architecture(
-					fen, args.architecture, mirror_files=False
-				)
-			)
+			features_batch.append(encode_fen_perspective_v3(fen))
 			targets_batch.append(target)
 			flags_batch.append(
 				{
@@ -1617,11 +1207,8 @@ def evaluate_validation_buckets(model, args, raw_rows, sample_fraction, steps):
 
 
 def evaluate_validation_buckets_cached(model, cache, indices, args, steps):
-	"""Bucketed validation MAE from cached rows.
-
-	Mate rows are not distinguishable from other clipped rows in the cache,
-	so only the clipped bucket is reported.
-	"""
+	# Mate rows are not distinguishable from other clipped rows in the
+	# cache, so only the clipped bucket is reported.
 	if steps == 0 or len(indices) == 0:
 		return {}
 
@@ -1637,7 +1224,8 @@ def evaluate_validation_buckets_cached(model, cache, indices, args, steps):
 	for start in range(0, max_examples, args.batch_size):
 		batch_indices = indices[start:start + args.batch_size]
 		features = unpack_features(
-			cache.boards[batch_indices], cache.metadata[batch_indices]
+			cache.boards[batch_indices],
+			cache.metadata[batch_indices],
 		)
 		targets = cache.targets[batch_indices].astype(np.float32)
 		targets = np.clip(targets, -clip, clip)
@@ -1651,16 +1239,12 @@ def evaluate_validation_buckets_cached(model, cache, indices, args, steps):
 
 
 def make_generator_train_eval_dataset(args, raw_rows, sample_fraction):
-	"""Materialize a fixed train-split subsample for inference-mode MAE.
-
-	The CSV path has no random access, so the first examples of the training
-	split are encoded once up front and kept in memory as float16.
-	"""
+	# The CSV path has no random access, so the first examples of the
+	# training split are encoded once up front and kept in memory.
 	count = args.train_split_eval_examples
 	if count == 0:
 		return None
-	feature_size = feature_size_for_architecture(args.architecture)
-	features = np.empty((count, feature_size), dtype=np.float16)
+	features = np.empty((count, PERSPECTIVE_V3_FEATURE_SIZE), dtype=np.float16)
 	targets = np.empty((count, 1), dtype=np.float32)
 	collected = 0
 	for example_features, example_target in iter_examples(
@@ -1671,7 +1255,6 @@ def make_generator_train_eval_dataset(args, raw_rows, sample_fraction):
 		sample_seed=args.sample_seed,
 		split_seed=args.split_seed,
 		max_abs_pawns=args.max_abs_pawns,
-		architecture=args.architecture,
 	):
 		features[collected] = example_features
 		targets[collected] = example_target
@@ -1703,7 +1286,7 @@ def write_training_report(
 	train_split_results=None,
 ):
 	report = {
-		"architecture": args.architecture,
+		"architecture": ARCHITECTURE,
 		"data_file": str(args.data_file),
 		"encoded_cache_dir": (
 			str(args.encoded_cache_dir)
@@ -1719,7 +1302,12 @@ def write_training_report(
 			str(path): int(row_count)
 			for path, row_count in extra_row_counts.items()
 		},
-		"input": input_description_for_architecture(args.architecture),
+		"input": (
+			f"{PERSPECTIVE_V3_FEATURE_SIZE} values: "
+			f"{PERSPECTIVE_V3_BOARD_FEATURE_SIZE} side-to-move perspective "
+			f"piece/attack/tactical board values and "
+			f"{PERSPECTIVE_V3_METADATA_SIZE} metadata values"
+		),
 		"target": {
 			"units": "pawns",
 			"clip": [-float(args.max_abs_pawns), float(args.max_abs_pawns)],
@@ -1765,8 +1353,7 @@ def write_training_report(
 
 
 def prepare_cached_data(args):
-	"""Datasets served from a pre-encoded on-disk cache (fast path)."""
-	cache = EncodedCache(args.encoded_cache_dir)
+	cache = EncodedCache(args.encoded_cache_dir, architecture=ARCHITECTURE)
 	if cache.train_only:
 		raise ValueError(
 			"the primary encoded cache must contain train/validation/test "
@@ -1803,7 +1390,7 @@ def prepare_cached_data(args):
 	extra_caches = []
 	extra_row_counts = {}
 	for path in args.extra_cache_dir:
-		extra_cache = EncodedCache(path)
+		extra_cache = EncodedCache(path, architecture=ARCHITECTURE)
 		if args.max_abs_pawns > extra_cache.max_abs_pawns:
 			raise ValueError(
 				f"extra cache {path} is clipped to "
@@ -1868,7 +1455,6 @@ def prepare_cached_data(args):
 
 
 def prepare_generator_data(args):
-	"""Datasets streamed from the CSV with per-example Python encoding."""
 	if can_use_default_split_counts(args):
 		print("Using known default source and split counts.", flush=True)
 		raw_rows = DEFAULT_SOURCE_ROWS
@@ -1985,16 +1571,15 @@ def main():
 			print(f"Extra data file: {path}")
 	for path in args.extra_cache_dir:
 		print(f"Extra cache: {path}")
-	print(f"Architecture: {args.architecture}")
-	if args.architecture != ARCHITECTURE_PAPER_MLP:
-		print(
-			"Transformer: "
-			f"d_model={args.transformer_d_model}, "
-			f"heads={args.transformer_heads}, "
-			f"layers={args.transformer_layers}, "
-			f"ff_dim={args.transformer_ff_dim}, "
-			f"dropout={args.transformer_dropout:g}"
-		)
+	print(f"Architecture: {ARCHITECTURE}")
+	print(
+		"Transformer: "
+		f"d_model={args.transformer_d_model}, "
+		f"heads={args.transformer_heads}, "
+		f"layers={args.transformer_layers}, "
+		f"ff_dim={args.transformer_ff_dim}, "
+		f"dropout={args.transformer_dropout:g}"
+	)
 	print(f"Source rows considered: {raw_rows}")
 	print(
 		f"Deterministic sample: {sum(split_counts.values())} positions "
@@ -2014,7 +1599,6 @@ def main():
 	if args.mirror_augmentation:
 		print("Train augmentation: horizontal mirror")
 	print(f"Training examples per epoch: {examples_per_epoch}")
-	print(f"Input: {input_description_for_architecture(args.architecture)}")
 	print(f"Target: clipped to [-{args.max_abs_pawns:g}, +{args.max_abs_pawns:g}] pawns")
 	print(f"Loss: {loss_description(args)}")
 	print("Metric: MAE in pawns")

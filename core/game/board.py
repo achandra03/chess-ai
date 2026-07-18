@@ -42,13 +42,15 @@ class Board:
 		self.turn = 0
 
 	def has_queenside_castling_rights(self, side):
-		if(side == 0): #black
+		# side 0 = black, side 1 = white. Kings/rooks are identified by
+		# filename string; board_from_fen relies on these exact names.
+		if(side == 0):
 			if(self.pieces[0][4] is not None and self.pieces[0][4].filename == 'blackking.png' and not self.pieces[0][4].hasMoved):
 				if(self.pieces[0][0] is not None and self.pieces[0][0].filename == 'blackrook.png' and not self.pieces[0][0].hasMoved):
 					return 1
 			return 0
 
-		else: #white
+		else:
 			if(self.pieces[7][4] is not None and self.pieces[7][4].filename == 'whiteking.png' and not self.pieces[7][4].hasMoved):
 				if(self.pieces[7][0] is not None and self.pieces[7][0].filename == 'whiterook.png' and not self.pieces[7][0].hasMoved):
 					return 1
@@ -56,13 +58,13 @@ class Board:
 
 
 	def has_kingside_castling_rights(self, side):
-		if(side == 0): #black
+		if(side == 0):
 			if(self.pieces[0][4] is not None and self.pieces[0][4].filename == 'blackking.png' and not self.pieces[0][4].hasMoved):
 				if(self.pieces[0][7] is not None and self.pieces[0][7].filename == 'blackrook.png' and not self.pieces[0][7].hasMoved):
 					return 1
 			return 0
 
-		else: #white
+		else:
 			if(self.pieces[7][4] is not None and self.pieces[7][4].filename == 'whiteking.png' and not self.pieces[7][4].hasMoved):
 				if(self.pieces[7][7] is not None and self.pieces[7][7].filename == 'whiterook.png' and not self.pieces[7][7].hasMoved):
 					return 1
@@ -72,58 +74,60 @@ class Board:
 	def makeMove(self, x, y, newX, newY):
 		p = self.pieces[y][x]
 
-		#Empty square selected
 		if(p is None):
 			return False
 
-		#Attempting to move to a square occupied by friendly piece
 		if(self.pieces[newY][newX] is not None and self.pieces[newY][newX].white == p.white):
 			return False
 
-		#Piece cannot move in the manner described
 		if(not self.pieces[y][x].makeMove(newX, newY, self.pieces)):
 			return False
 
-		#Path must be clear (barring knights)
 		if(type(p) is not Knight and self.pathBlocked(x, y, newX, newY)):
 			return False
 
-		#Taking snapshot of board in case reversion is needed
+		# A castling king may not start in check or pass through an
+		# attacked square.
+		if(type(p) is King and abs(newX - x) == 2):
+			if(self.checked(p.white)):
+				return False
+			p.x = x + 1 if newX > x else x - 1
+			self.update()
+			passesThroughCheck = self.checked(p.white)
+			p.x = x
+			self.update()
+			if(passesThroughCheck):
+				return False
+
 		snapshot = copy.deepcopy(self.pieces)
 
-		#Right castle - right corner rook needs to be updated
 		if(type(p) is King and newX == x + 2):
 			rook = self.pieces[y][7]
 			rook.x -= 2
 			rook.hasMoved = True
 
-		#Left castle - left corner rook needs to be updated
 		if(type(p) is King and newX == x - 2):
 			rook = self.pieces[y][0]
 			rook.x += 3
 			rook.hasMoved = True
 
-		#Update piece being moved and board in general
 		p.hasMoved = True
 		p.x = newX
 		p.y = newY
 		self.pieces[newY][newX] = None
 		self.update()
-        
 
-		#Handle promotion
+		# Promotion is always to a queen.
 		if(type(p) is Pawn):
 			if(p.white and p.y == 0):
 				self.pieces[p.y][p.x] = Queen(p.x, p.y, p.white, 'whitequeen.png', 'Q')
 			elif(not p.white and p.y == 7):
 				self.pieces[p.y][p.x] = Queen(p.x, p.y, p.white, 'blackqueen.png', 'q')
 
-		#Revert back to old state if king is in check
 		if(self.checked(p.white)):
 			self.pieces = snapshot
 			return False
-	
-		#Move is valid
+
 		self.update()
 		if(self.turn == 0):
 			self.turn = 1
@@ -132,8 +136,6 @@ class Board:
 		return True
 
 
-
-	
 	def pathBlocked(self, x, y, newX, newY):
 		dy = 0
 		dx = 0
@@ -174,7 +176,6 @@ class Board:
 
 
 	def checked(self, white):
-		#Get location of king
 		king = None
 		for row in self.pieces:
 			for piece in row:
@@ -186,8 +187,7 @@ class Board:
 		if(king is None):
 			print('Cannot find king')
 			exit(0)
-		
-		#Check for queens, rooks, and bishops
+
 		for dx in range(-1, 2):
 			for dy in range(-1, 2):
 				if(dx == 0 and dy == 0):
@@ -195,7 +195,6 @@ class Board:
 				if(self.moveAlongPath(king.x, king.y, dx, dy, king.white)):
 					return True
 
-		#Check for knights
 		if(king.y < 7 and king.x < 6 and self.pieces[king.y + 1][king.x + 2] is not None and type(self.pieces[king.y + 1][king.x + 2]) is Knight and self.pieces[king.y + 1][king.x + 2].white != white):
 			return True
 		if(king.y < 6 and king.x < 7 and self.pieces[king.y + 2][king.x + 1] is not None and type(self.pieces[king.y + 2][king.x + 1]) is Knight and self.pieces[king.y + 2][king.x + 1].white != white):
@@ -212,8 +211,7 @@ class Board:
 			return True
 		if(king.y > 0 and king.x < 6 and self.pieces[king.y - 1][king.x + 2] is not None and type(self.pieces[king.y - 1][king.x + 2]) is Knight and self.pieces[king.y - 1][king.x + 2].white != white):
 			return True
-		
-		#Check for pawns
+
 		if(white):
 			if(king.y - 1 > -1 and king.x - 1 > -1):
 				if(self.pieces[king.y - 1][king.x - 1] is not None and type(self.pieces[king.y - 1][king.x - 1]) is Pawn and self.pieces[king.y - 1][king.x - 1].white != white):
@@ -230,8 +228,6 @@ class Board:
 				if(self.pieces[king.y + 1][king.x + 1] is not None and type(self.pieces[king.y + 1][king.x + 1]) is Pawn and self.pieces[king.y + 1][king.x + 1].white != white):
 					return True
 
-
-		#Check for enemy king
 		for dx in range(-1, 2):
 			for dy in range(-1, 2):
 				if(dx == 0 and dy == 0):
@@ -248,13 +244,12 @@ class Board:
 		return False
 
 
-
-
 	def moveAlongPath(self, x, y, dx, dy, white):
+		# Straight rays look for queens/rooks, diagonal rays for
+		# queens/bishops.
 		x += dx
 		y += dy
 		while(x > -1 and x < 8 and y > -1 and y < 8):
-			#If either dx or dy is 0, we are looking for queens/rooks
 			if(dx == 0 or dy == 0):
 				if(self.pieces[y][x] is None):
 					x += dx
@@ -264,7 +259,6 @@ class Board:
 					return True
 				break
 
-			#Otherwise we are looking for queens/bishops
 			else:
 				if(self.pieces[y][x] is None):
 					x += dx
@@ -283,55 +277,124 @@ class Board:
 					continue
 				y = self.pieces[i][j].y
 				x = self.pieces[i][j].x
-				print(type(self.pieces[y][x]), 'on', y, x)	
+				print(type(self.pieces[y][x]), 'on', y, x)
 
 
-	def allMoves(self, w):
-		#Returns a list of all possible moves in the form (y, x, newY, newX)
+	def candidateSquares(self, piece):
+		# Geometric destination candidates (newY, newX): a small superset of
+		# the piece's legal destinations. Legality (pins, checks, castling
+		# conditions) is still decided by trial makeMove.
+		x = piece.x
+		y = piece.y
 		res = []
-		for i in range(0, 8):
-			for j in range(0, 8):
-				if(self.pieces[i][j] is None or self.pieces[i][j].white != w):
+
+		if(type(piece) is Pawn):
+			dy = -1 if piece.white else 1
+			if(y + dy < 0 or y + dy > 7):
+				return res
+			if(self.pieces[y + dy][x] is None):
+				res.append((y + dy, x))
+				if(not piece.hasMoved and y + 2 * dy > -1 and y + 2 * dy < 8 and self.pieces[y + 2 * dy][x] is None):
+					res.append((y + 2 * dy, x))
+			for dx in (-1, 1):
+				if(x + dx < 0 or x + dx > 7):
 					continue
-				x = self.pieces[i][j].x
-				y = self.pieces[i][j].y
-				for a in range(0, 8):
-					for b in range(0, 8):
-						if(x == b and y == a):
-							continue
-						snapshot = copy.deepcopy(self.pieces), self.turn
-						if(self.makeMove(x, y, b, a)):
-							curr = [y, x, a, b]
-							res.append(curr)
-							self.pieces, self.turn = snapshot
+				target = self.pieces[y + dy][x + dx]
+				if(target is not None and target.white != piece.white):
+					res.append((y + dy, x + dx))
+			return res
+
+		if(type(piece) is Knight):
+			for dy, dx in ((1, 2), (2, 1), (2, -1), (1, -2), (-1, -2), (-2, -1), (-2, 1), (-1, 2)):
+				a = y + dy
+				b = x + dx
+				if(a < 0 or a > 7 or b < 0 or b > 7):
+					continue
+				if(self.pieces[a][b] is None or self.pieces[a][b].white != piece.white):
+					res.append((a, b))
+			return res
+
+		if(type(piece) is King):
+			for dy in range(-1, 2):
+				for dx in range(-1, 2):
+					if(dy == 0 and dx == 0):
+						continue
+					a = y + dy
+					b = x + dx
+					if(a < 0 or a > 7 or b < 0 or b > 7):
+						continue
+					if(self.pieces[a][b] is None or self.pieces[a][b].white != piece.white):
+						res.append((a, b))
+			if(not piece.hasMoved):
+				if(x + 2 < 8):
+					res.append((y, x + 2))
+				if(x - 2 > -1):
+					res.append((y, x - 2))
+			return res
+
+		directions = []
+		if(type(piece) is Rook or type(piece) is Queen):
+			directions += [(0, 1), (0, -1), (1, 0), (-1, 0)]
+		if(type(piece) is Bishop or type(piece) is Queen):
+			directions += [(1, 1), (1, -1), (-1, 1), (-1, -1)]
+		for dy, dx in directions:
+			a = y + dy
+			b = x + dx
+			while(a > -1 and a < 8 and b > -1 and b < 8):
+				if(self.pieces[a][b] is None):
+					res.append((a, b))
+					a += dy
+					b += dx
+					continue
+				if(self.pieces[a][b].white != piece.white):
+					res.append((a, b))
+				break
 		return res
 
 
-	def captureMoves(self, w):
-		#Returns all legal captures and promotion pushes in the form (y, x, newY, newX)
-		targets = []
-		for a in range(0, 8):
-			for b in range(0, 8):
-				if(self.pieces[a][b] is not None and self.pieces[a][b].white != w):
-					targets.append((a, b))
-
+	def allMoves(self, w):
+		# All legal moves in the form (y, x, newY, newX).
 		res = []
 		for i in range(0, 8):
 			for j in range(0, 8):
-				if(self.pieces[i][j] is None or self.pieces[i][j].white != w):
+				piece = self.pieces[i][j]
+				if(piece is None or piece.white != w):
 					continue
-				x = self.pieces[i][j].x
-				y = self.pieces[i][j].y
-				currTargets = targets
-				if(type(self.pieces[i][j]) is Pawn):
-					if(w and y == 1 and self.pieces[0][x] is None):
-						currTargets = targets + [(0, x)]
-					elif(not w and y == 6 and self.pieces[7][x] is None):
-						currTargets = targets + [(7, x)]
-				for a, b in currTargets:
+				x = piece.x
+				y = piece.y
+				for a, b in self.candidateSquares(piece):
 					snapshot = copy.deepcopy(self.pieces), self.turn
 					if(self.makeMove(x, y, b, a)):
 						curr = [y, x, a, b]
 						res.append(curr)
 						self.pieces, self.turn = snapshot
 		return res
+
+
+	def noisyMoves(self, w, includeChecks=False):
+		# All legal captures and promotion pushes; with includeChecks, quiet
+		# moves that give check as well.
+		res = []
+		for i in range(0, 8):
+			for j in range(0, 8):
+				piece = self.pieces[i][j]
+				if(piece is None or piece.white != w):
+					continue
+				x = piece.x
+				y = piece.y
+				for a, b in self.candidateSquares(piece):
+					noisy = self.pieces[a][b] is not None or (type(piece) is Pawn and (a == 0 or a == 7))
+					if(not noisy and not includeChecks):
+						continue
+					snapshot = copy.deepcopy(self.pieces), self.turn
+					if(self.makeMove(x, y, b, a)):
+						keep = noisy or self.checked(not w)
+						self.pieces, self.turn = snapshot
+						if(keep):
+							curr = [y, x, a, b]
+							res.append(curr)
+		return res
+
+
+	def captureMoves(self, w):
+		return self.noisyMoves(w, False)

@@ -5,7 +5,6 @@ import os
 filedir = '/Users/arnavchandra/Desktop/chess/core/game/assets/pieces/'
 
 def convert(filename):
-	# load image
 	img = cv2.imread(filedir + filename)
 
 	height, width, _ = img.shape
