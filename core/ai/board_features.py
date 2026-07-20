@@ -131,6 +131,12 @@ def selected_for_sample(fen, sample_fraction, sample_seed):
 	return hash_fraction(sample_seed, position_key(fen)) < sample_fraction
 
 
+def sample_fraction_for(raw_rows, sample_size):
+	if sample_size == 0 or sample_size >= raw_rows:
+		return 1.0
+	return sample_size / raw_rows
+
+
 def encode_fen_perspective_v3(fen, mirror_files=False):
 	fields = str(fen).strip().split()
 	if len(fields) < 4:

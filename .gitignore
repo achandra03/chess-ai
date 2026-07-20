@@ -6,3 +6,4 @@ data/
 *.pyc
 *.swp
 .lichess_token
+*.bak

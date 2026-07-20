@@ -42,8 +42,7 @@ class Board:
 		self.turn = 0
 
 	def has_queenside_castling_rights(self, side):
-		# side 0 = black, side 1 = white. Kings/rooks are identified by
-		# filename string; board_from_fen relies on these exact names.
+		# side 0 = black, side 1 = white.
 		if(side == 0):
 			if(self.pieces[0][4] is not None and self.pieces[0][4].filename == 'blackking.png' and not self.pieces[0][4].hasMoved):
 				if(self.pieces[0][0] is not None and self.pieces[0][0].filename == 'blackrook.png' and not self.pieces[0][0].hasMoved):
@@ -245,8 +244,6 @@ class Board:
 
 
 	def moveAlongPath(self, x, y, dx, dy, white):
-		# Straight rays look for queens/rooks, diagonal rays for
-		# queens/bishops.
 		x += dx
 		y += dy
 		while(x > -1 and x < 8 and y > -1 and y < 8):
@@ -269,16 +266,6 @@ class Board:
 				break
 
 		return False
-
-	def listPieces(self, w):
-		for i in range(0, 8):
-			for j in range(0, 8):
-				if(self.pieces[i][j] is None or self.pieces[i][j].white != w):
-					continue
-				y = self.pieces[i][j].y
-				x = self.pieces[i][j].x
-				print(type(self.pieces[y][x]), 'on', y, x)
-
 
 	def candidateSquares(self, piece):
 		# Geometric destination candidates (newY, newX): a small superset of
@@ -353,7 +340,7 @@ class Board:
 
 
 	def allMoves(self, w):
-		# All legal moves in the form (y, x, newY, newX).
+		"""All legal moves for side w as [y, x, newY, newX]."""
 		res = []
 		for i in range(0, 8):
 			for j in range(0, 8):
@@ -372,8 +359,10 @@ class Board:
 
 
 	def noisyMoves(self, w, includeChecks=False):
-		# All legal captures and promotion pushes; with includeChecks, quiet
-		# moves that give check as well.
+		"""Legal captures and promotion pushes as [y, x, newY, newX].
+
+		With includeChecks, quiet moves that give check are included too.
+		"""
 		res = []
 		for i in range(0, 8):
 			for j in range(0, 8):
@@ -394,7 +383,3 @@ class Board:
 							curr = [y, x, a, b]
 							res.append(curr)
 		return res
-
-
-	def captureMoves(self, w):
-		return self.noisyMoves(w, False)

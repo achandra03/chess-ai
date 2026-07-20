@@ -1,6 +1,4 @@
 import copy
-import importlib.util
-import sys
 import time
 from pathlib import Path
 
@@ -13,6 +11,8 @@ from board_features import (
 	board_position_key,
 	encode_board_perspective_v3,
 )
+# Also registers SquarePositionEmbedding, which .keras deserialization needs.
+from model import build_perspective_transformer_v3_model
 
 
 MATE_SCORE = 100000.0
@@ -72,18 +72,15 @@ class Engine:
 		raise FileNotFoundError("no evaluator model found in core/ai")
 
 	def _load_model(self, path):
-		train = self._load_train_module()
 		if path.name.endswith(".weights.h5"):
 			if path.name != PERSPECTIVE_V3_WEIGHTS_NAME:
 				raise ValueError(
 					f"cannot infer evaluator architecture from weights file "
 					f"{path}; pass a full .keras model instead"
 				)
-			model = train.build_perspective_transformer_v3_model()
+			model = build_perspective_transformer_v3_model()
 			model.load_weights(str(path))
 		else:
-			# Loading the train module first registers the custom layers
-			# (SquarePositionEmbedding) that .keras deserialization needs.
 			model = tf.keras.models.load_model(str(path), compile=False)
 		input_shape = model.input_shape
 		if isinstance(input_shape, list):
@@ -94,25 +91,6 @@ class Engine:
 				f"perspective-v3 feature size {PERSPECTIVE_V3_FEATURE_SIZE}"
 			)
 		return model
-
-	def _load_train_module(self):
-		loaded_train = sys.modules.get("train")
-		if loaded_train is not None and hasattr(
-			loaded_train, "build_perspective_transformer_v3_model"
-		):
-			return loaded_train
-		loaded_train = sys.modules.get("chess_ai_evaluator_train")
-		if loaded_train is not None:
-			return loaded_train
-
-		train_path = Path(__file__).resolve().with_name("train.py")
-		spec = importlib.util.spec_from_file_location(
-			"chess_ai_evaluator_train", train_path
-		)
-		module = importlib.util.module_from_spec(spec)
-		sys.modules["chess_ai_evaluator_train"] = module
-		spec.loader.exec_module(module)
-		return module
 
 	def nn_input(self):
 		return encode_board_perspective_v3(self.board).reshape(
@@ -461,7 +439,15 @@ class Engine:
 		start = time.perf_counter()
 		self._deadline = None if time_budget is None else start + time_budget
 
-		best_move = None
+		# Seed with an ordered legal move. A search that runs out of time
+		# before completing even the first iteration must still return
+		# something playable; None is reserved for "no legal moves", which
+		# is how callers distinguish checkmate and stalemate.
+		root_moves = self.board.allMoves(root_white)
+		if not root_moves:
+			return None
+		best_move = self._order_moves(root_moves)[0]
+
 		try:
 			for depth in range(1, max_depth + 1):
 				if depth > 1 and time_budget is not None:
